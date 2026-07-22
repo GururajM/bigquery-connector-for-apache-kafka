@@ -181,7 +181,8 @@ public abstract class GcpClientBuilder<ClientT> {
   public enum KeySource {
     FILE,
     JSON,
-    APPLICATION_DEFAULT
+    APPLICATION_DEFAULT,
+    WIF_JSON
   }
 
   public static class BigQueryBuilder extends GcpClientBuilder<BigQuery> {
