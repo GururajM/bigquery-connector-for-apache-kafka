@@ -23,6 +23,8 @@
 
 package com.wepay.kafka.connect.bigquery;
 
+import static com.wepay.kafka.connect.bigquery.utils.GsonUtils.getAsString;
+
 import com.google.auth.oauth2.AwsSecurityCredentials;
 import com.google.auth.oauth2.AwsSecurityCredentialsSupplier;
 import com.google.auth.oauth2.ExternalAccountSupplierContext;
@@ -152,9 +154,9 @@ public class EcsAwsSecurityCredentialsSupplier implements AwsSecurityCredentials
     if (json == null) {
       throw new IOException("AWS container credentials response was not valid JSON");
     }
-    String accessKeyId = asString(json, "AccessKeyId");
-    String secretAccessKey = asString(json, "SecretAccessKey");
-    String token = asString(json, "Token");
+    String accessKeyId = getAsString(json, "AccessKeyId");
+    String secretAccessKey = getAsString(json, "SecretAccessKey");
+    String token = getAsString(json, "Token");
     // Token (the STS session token) is required: the ECS/Fargate endpoint only ever serves
     // temporary role credentials, and google-auth must include it when SigV4-signing the
     // GetCallerIdentity request. A missing token means a broken response and would otherwise
@@ -173,10 +175,6 @@ public class EcsAwsSecurityCredentialsSupplier implements AwsSecurityCredentials
     }
     String trimmed = value.trim();
     return trimmed.isEmpty() ? null : trimmed;
-  }
-
-  private static String asString(JsonObject json, String field) {
-    return json.has(field) && !json.get(field).isJsonNull() ? json.get(field).getAsString() : null;
   }
 
   /**
