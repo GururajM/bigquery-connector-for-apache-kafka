@@ -81,6 +81,32 @@ Only AWS external accounts are supported today. The connector reads the AWS task
 from the ECS/Fargate container-credentials endpoint, so it works where google-auth's built-in AWS
 provider does not.
 
+**Supported environments.** That endpoint (`169.254.170.2`) is exposed by the ECS agent to any ECS
+task that has a `taskRoleArn`, so `WIF_JSON` works on **ECS Fargate and the ECS EC2 launch type
+alike**. It does **not** support:
+
+- **Plain EC2** — a Connect worker running on an instance profile, outside ECS.
+- **An ECS task without a `taskRoleArn`**, which falls back to the host's instance profile.
+- **EKS** — neither EKS Pod Identity nor IRSA is supported yet.
+
+The first two expose credentials only through the EC2 instance metadata service
+(IMDS, `169.254.169.254`), which this connector does not read. Injecting
+`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` does not help either — under `WIF_JSON` the connector
+sources AWS credentials solely from the container endpoint and never consults the environment. Use
+`keySource=JSON` or `FILE` with a service-account key on such hosts.
+
+EKS delivers credentials differently again: **Pod Identity** uses a separate endpoint advertised via
+`AWS_CONTAINER_CREDENTIALS_FULL_URI`, with a bearer token from
+`AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`, while **IRSA** projects an OIDC token at
+`AWS_WEB_IDENTITY_TOKEN_FILE` and uses no credentials endpoint at all. Both are plausible additions
+(for IRSA, configuring the cluster's OIDC issuer as a GCP *OIDC* provider avoids the AWS path
+entirely), but neither is implemented or tested today.
+
+Note that these failures surface at **runtime, not during connector configuration validation**: the
+credentials are only fetched when a token is first needed, so the connector starts successfully and
+then fails its first BigQuery call with
+`Environment variable AWS_CONTAINER_CREDENTIALS_RELATIVE_URI is not set`.
+
 Connector configuration:
 
 ```json
@@ -113,14 +139,21 @@ connector's URL allowlist. Replace the `<...>` placeholders:
 
 **AWS/GCP setup prerequisites** (configured outside the connector):
 
+- The ECS task must run with an IAM **task role** (`taskRoleArn` in the task definition). That role
+  is the AWS identity federated into GCP, and ECS injects `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`
+  (the credentials endpoint the connector reads) automatically — there is nothing to set in the
+  connector or keyfile for it.
 - The Workload Identity Pool **AWS provider** attribute mapping must keep `google.subject` ≤ 127
   bytes — map it to the normalized role ARN (`arn:aws:iam::<ACCOUNT>:role/<ROLE>`), not the full
   assumed-role ARN with session name.
 - Grant `roles/iam.workloadIdentityUser` on the target service account, bound to
   `principalSet://iam.googleapis.com/projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<POOL_ID>/attribute.aws_role/arn:aws:sts::<ACCOUNT>:assumed-role/<ROLE>`.
 - The service account needs `roles/bigquery.dataEditor` and `roles/bigquery.jobUser`.
-- On Fargate, `AWS_REGION` (or `AWS_DEFAULT_REGION`) must be set — it is by default on Fargate — as
-  the region is part of the request signature.
+- `AWS_REGION` (or `AWS_DEFAULT_REGION`) must be set — the region is part of the STS request
+  signature, and there is no default. Fargate always injects it. The ECS **EC2 launch type** only
+  injects it with container agent v1.104.0 or later (ECS-optimized AMI `20260615`+); on older agents
+  it is absent and the connector will fail on its first BigQuery call. Set it explicitly in the task
+  definition to be safe on both.
 
 #### Verifying on ECS Fargate
 
