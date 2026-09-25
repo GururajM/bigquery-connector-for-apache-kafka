@@ -86,6 +86,14 @@ public class BigQuerySinkConfig extends AbstractConfig {
     }
   }
 
+  /** How upsert/delete changes are applied when the Storage Write API is used. */
+  public enum StorageWriteApiUpsertMode {
+    /** Rows are streamed to the destination with BigQuery CDC pseudo-columns. */
+    CDC,
+    /** Rows are streamed to a staging table and applied with connector-issued MERGE statements. */
+    MERGE
+  }
+
   private static final Logger logger = LoggerFactory.getLogger(BigQuerySinkConfig.class);
 
   // Values taken from
@@ -158,6 +166,9 @@ public class BigQuerySinkConfig extends AbstractConfig {
   public static final String COMMIT_INTERVAL_SEC_CONFIG = "commitInterval";
   public static final String DELETE_ENABLED_CONFIG = "deleteEnabled";
   public static final boolean DELETE_ENABLED_DEFAULT = false;
+  public static final String STORAGE_WRITE_API_UPSERT_MODE_CONFIG = "storageWriteApiUpsertMode";
+  public static final String STORAGE_WRITE_API_UPSERT_MODE_DEFAULT =
+      StorageWriteApiUpsertMode.CDC.name();
   public static final String INTERMEDIATE_TABLE_SUFFIX_CONFIG = "intermediateTableSuffix";
   public static final String INTERMEDIATE_TABLE_SUFFIX_DEFAULT = "tmp";
   public static final String MERGE_INTERVAL_MS_CONFIG = "mergeIntervalMs";
@@ -510,6 +521,29 @@ public class BigQuerySinkConfig extends AbstractConfig {
       "Enable delete functionality on the connector through the use of record keys, intermediate "
           + "tables, and periodic merge flushes. A delete will be performed when a record with a null "
           + "value (i.e., a tombstone record) is read.";
+  private static final ConfigDef.Type STORAGE_WRITE_API_UPSERT_MODE_TYPE = ConfigDef.Type.STRING;
+  private static final ConfigDef.Validator STORAGE_WRITE_API_UPSERT_MODE_VALIDATOR =
+      ConfigDef.CaseInsensitiveValidString.in(
+          Stream.of(StorageWriteApiUpsertMode.values())
+              .map(StorageWriteApiUpsertMode::name)
+              .toArray(String[]::new));
+  private static final ConfigDef.Importance STORAGE_WRITE_API_UPSERT_MODE_IMPORTANCE =
+      ConfigDef.Importance.LOW;
+  private static final String STORAGE_WRITE_API_UPSERT_MODE_DOC =
+      "How upsert/delete changes are applied when "
+          + USE_STORAGE_WRITE_API_CONFIG
+          + " is true and "
+          + UPSERT_ENABLED_CONFIG
+          + " or "
+          + DELETE_ENABLED_CONFIG
+          + " is true. "
+          + StorageWriteApiUpsertMode.CDC.name()
+          + " streams rows directly to the destination table and lets BigQuery change data "
+          + "capture apply them; the Kafka key becomes the table's primary key. "
+          + StorageWriteApiUpsertMode.MERGE.name()
+          + " streams rows to an intermediate table and applies them to the destination with "
+          + "periodic MERGE statements, as when the Storage Write API is disabled. "
+          + "Ignored in all other cases.";
   private static final ConfigDef.Type INTERMEDIATE_TABLE_SUFFIX_TYPE = ConfigDef.Type.STRING;
   private static final ConfigDef.Validator INTERMEDIATE_TABLE_SUFFIX_VALIDATOR =
       new ConfigDef.NonEmptyString();
@@ -856,6 +890,7 @@ public class BigQuerySinkConfig extends AbstractConfig {
     SinceInfo v2m8 = since.version("2.8.0").build().setVersionOnly();
     SinceInfo v2m10 = since.version("2.10.0").build().setVersionOnly();
     SinceInfo v2m15 = since.version("2.15.0").build().setVersionOnly();
+    SinceInfo v2m16 = since.version("2.16.0").build().setVersionOnly();
     return new ConfigDef()
         .define(
             TOPICS_CONFIG,
@@ -1037,6 +1072,15 @@ public class BigQuerySinkConfig extends AbstractConfig {
                     USE_STORAGE_WRITE_API_CONFIG,
                     MERGE_INTERVAL_MS_CONFIG,
                     KAFKA_KEY_FIELD_NAME_CONFIG)
+                .build())
+        .define(
+            ExtendedConfigKey.builder(STORAGE_WRITE_API_UPSERT_MODE_CONFIG)
+                .type(STORAGE_WRITE_API_UPSERT_MODE_TYPE)
+                .defaultValue(STORAGE_WRITE_API_UPSERT_MODE_DEFAULT)
+                .validator(STORAGE_WRITE_API_UPSERT_MODE_VALIDATOR)
+                .importance(STORAGE_WRITE_API_UPSERT_MODE_IMPORTANCE)
+                .documentation(STORAGE_WRITE_API_UPSERT_MODE_DOC)
+                .since(v2m16)
                 .build())
         .define(
             INTERMEDIATE_TABLE_SUFFIX_CONFIG,
@@ -1527,6 +1571,28 @@ public class BigQuerySinkConfig extends AbstractConfig {
    */
   public boolean useStorageWriteApi() {
     return getBoolean(USE_STORAGE_WRITE_API_CONFIG);
+  }
+
+  /**
+   * @return the configured {@link StorageWriteApiUpsertMode}; only meaningful when the Storage
+   *     Write API is used with upsert or delete enabled
+   */
+  public StorageWriteApiUpsertMode getStorageWriteApiUpsertMode() {
+    return StorageWriteApiUpsertMode.valueOf(
+        getString(STORAGE_WRITE_API_UPSERT_MODE_CONFIG).toUpperCase(Locale.ROOT));
+  }
+
+  /**
+   * Determines if upsert/delete changes are written through the Storage Write API to an
+   * intermediate table and applied with connector-issued MERGE statements.
+   *
+   * @return {@code true} if the Storage Write API is used, upsert or delete is enabled, and {@link
+   *     #STORAGE_WRITE_API_UPSERT_MODE_CONFIG} is {@link StorageWriteApiUpsertMode#MERGE}
+   */
+  public boolean isStorageWriteApiMergeMode() {
+    return useStorageWriteApi()
+        && (isUpsertEnabled() || isDeleteEnabled())
+        && getStorageWriteApiUpsertMode() == StorageWriteApiUpsertMode.MERGE;
   }
 
   /**

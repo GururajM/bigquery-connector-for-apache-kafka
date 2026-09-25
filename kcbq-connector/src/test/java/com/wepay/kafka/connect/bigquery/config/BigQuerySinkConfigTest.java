@@ -26,6 +26,7 @@ package com.wepay.kafka.connect.bigquery.config;
 import static com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig.CONVERT_DEBEZIUM_DECIMAL_CONFIG;
 import static com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig.DEBEZIUM_VARIABLE_SCALE_DECIMAL_HANDLING_MODE_CONFIG;
 import static com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig.DECIMAL_HANDLING_MODE_CONFIG;
+import static com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig.STORAGE_WRITE_API_UPSERT_MODE_CONFIG;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -50,6 +51,7 @@ import org.apache.kafka.common.config.ConfigValue;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 
 public class BigQuerySinkConfigTest {
@@ -416,5 +418,58 @@ public class BigQuerySinkConfigTest {
             BigQuerySinkConfig.KAFKA_KEY_FIELD_NAME_CONFIG,
             BigQuerySinkConfig.GCS_BUCKET_NAME_CONFIG,
             "keyfile");
+  }
+
+  @Test
+  void testStorageWriteApiUpsertModeDefaultsToCdc() {
+    BigQuerySinkConfig config = new BigQuerySinkConfig(propertiesFactory.getProperties());
+    assertEquals(
+        BigQuerySinkConfig.StorageWriteApiUpsertMode.CDC, config.getStorageWriteApiUpsertMode());
+  }
+
+  @ParameterizedTest
+  @CsvSource({"MERGE, MERGE", "merge, MERGE", "Cdc, CDC"})
+  void testStorageWriteApiUpsertModeIsCaseInsensitive(
+      String value, BigQuerySinkConfig.StorageWriteApiUpsertMode expected) {
+    Map<String, String> configProperties = propertiesFactory.getProperties();
+    configProperties.put(STORAGE_WRITE_API_UPSERT_MODE_CONFIG, value);
+
+    BigQuerySinkConfig config = new BigQuerySinkConfig(configProperties);
+    assertEquals(expected, config.getStorageWriteApiUpsertMode());
+  }
+
+  @Test
+  void testInvalidStorageWriteApiUpsertMode() {
+    Map<String, String> configProperties = propertiesFactory.getProperties();
+    configProperties.put(STORAGE_WRITE_API_UPSERT_MODE_CONFIG, "APPEND");
+
+    assertThrows(ConfigException.class, () -> new BigQuerySinkConfig(configProperties));
+  }
+
+  @ParameterizedTest(name = "storageWriteApi={0}, upsert={1}, delete={2}, mode={3} -> {4}")
+  @CsvSource({
+    "true,  true,  false, MERGE, true",
+    "true,  false, true,  MERGE, true",
+    "true,  true,  true,  MERGE, true",
+    "true,  true,  false, CDC,   false",
+    "true,  false, false, MERGE, false",
+    "false, true,  false, MERGE, false",
+    "false, false, true,  MERGE, false"
+  })
+  void testIsStorageWriteApiMergeMode(
+      boolean useStorageWriteApi,
+      boolean upsertEnabled,
+      boolean deleteEnabled,
+      String mode,
+      boolean expected) {
+    Map<String, String> configProperties = propertiesFactory.getProperties();
+    configProperties.put(
+        BigQuerySinkConfig.USE_STORAGE_WRITE_API_CONFIG, String.valueOf(useStorageWriteApi));
+    configProperties.put(BigQuerySinkConfig.UPSERT_ENABLED_CONFIG, String.valueOf(upsertEnabled));
+    configProperties.put(BigQuerySinkConfig.DELETE_ENABLED_CONFIG, String.valueOf(deleteEnabled));
+    configProperties.put(STORAGE_WRITE_API_UPSERT_MODE_CONFIG, mode);
+
+    BigQuerySinkConfig config = new BigQuerySinkConfig(configProperties);
+    assertEquals(expected, config.isStorageWriteApiMergeMode());
   }
 }
