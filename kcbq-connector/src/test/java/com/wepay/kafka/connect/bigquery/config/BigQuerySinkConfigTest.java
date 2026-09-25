@@ -446,6 +446,37 @@ public class BigQuerySinkConfigTest {
     assertThrows(ConfigException.class, () -> new BigQuerySinkConfig(configProperties));
   }
 
+  @Test
+  void testStorageWriteApiMergeModeIsRejectedByValidation() {
+    Map<String, String> configProperties = propertiesFactory.getProperties();
+    configProperties.put(BigQuerySinkConfig.UPSERT_ENABLED_CONFIG, "true");
+    configProperties.put(BigQuerySinkConfig.USE_STORAGE_WRITE_API_CONFIG, "true");
+    configProperties.put(STORAGE_WRITE_API_UPSERT_MODE_CONFIG, "MERGE");
+
+    BigQuerySinkConfig config = new BigQuerySinkConfig(configProperties);
+    Map<String, ConfigValue> errors = errorMap(config.validate());
+    assertThat(errors.keySet())
+        .containsExactlyInAnyOrder(
+            BigQuerySinkConfig.UPSERT_ENABLED_CONFIG,
+            BigQuerySinkConfig.GCS_BUCKET_NAME_CONFIG,
+            "keyfile");
+    assertThat(errors.get(BigQuerySinkConfig.UPSERT_ENABLED_CONFIG).errorMessages())
+        .containsExactly(STORAGE_WRITE_API_UPSERT_MODE_CONFIG + "=MERGE is not yet supported");
+  }
+
+  @Test
+  void testStorageWriteApiCdcModePassesValidation() {
+    Map<String, String> configProperties = propertiesFactory.getProperties();
+    configProperties.put(BigQuerySinkConfig.UPSERT_ENABLED_CONFIG, "true");
+    configProperties.put(BigQuerySinkConfig.USE_STORAGE_WRITE_API_CONFIG, "true");
+    configProperties.put(STORAGE_WRITE_API_UPSERT_MODE_CONFIG, "CDC");
+
+    BigQuerySinkConfig config = new BigQuerySinkConfig(configProperties);
+    Map<String, ConfigValue> errors = errorMap(config.validate());
+    assertThat(errors.keySet())
+        .containsExactlyInAnyOrder(BigQuerySinkConfig.GCS_BUCKET_NAME_CONFIG, "keyfile");
+  }
+
   @ParameterizedTest(name = "storageWriteApi={0}, upsert={1}, delete={2}, mode={3} -> {4}")
   @CsvSource({
     "true,  true,  false, MERGE, true",

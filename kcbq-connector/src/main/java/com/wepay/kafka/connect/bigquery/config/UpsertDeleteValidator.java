@@ -27,6 +27,7 @@ import static com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig.DELETE_
 import static com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig.KAFKA_KEY_FIELD_NAME_CONFIG;
 import static com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig.MERGE_INTERVAL_MS_CONFIG;
 import static com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig.MERGE_RECORDS_THRESHOLD_CONFIG;
+import static com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig.STORAGE_WRITE_API_UPSERT_MODE_CONFIG;
 import static com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig.UPSERT_ENABLED_CONFIG;
 import static com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig.USE_STORAGE_WRITE_API_CONFIG;
 
@@ -44,7 +45,8 @@ public abstract class UpsertDeleteValidator extends MultiPropertyValidator<BigQu
               MERGE_INTERVAL_MS_CONFIG,
               MERGE_RECORDS_THRESHOLD_CONFIG,
               KAFKA_KEY_FIELD_NAME_CONFIG,
-              USE_STORAGE_WRITE_API_CONFIG));
+              USE_STORAGE_WRITE_API_CONFIG,
+              STORAGE_WRITE_API_UPSERT_MODE_CONFIG));
   private static final Logger logger = LoggerFactory.getLogger(UpsertDeleteValidator.class);
 
   private UpsertDeleteValidator(String propertyName) {
@@ -77,6 +79,16 @@ public abstract class UpsertDeleteValidator extends MultiPropertyValidator<BigQu
       }
 
     } else {
+      // TODO: remove once records are routed through the intermediate table and merge batches
+      // track Storage Write API writes; until then MERGE mode would never commit offsets
+      if (config.isStorageWriteApiMergeMode()) {
+        return Optional.of(
+            String.format(
+                "%s=%s is not yet supported",
+                STORAGE_WRITE_API_UPSERT_MODE_CONFIG,
+                BigQuerySinkConfig.StorageWriteApiUpsertMode.MERGE.name()));
+      }
+
       // Storage Write API CDC path
       for (String property :
           Arrays.asList(MERGE_INTERVAL_MS_CONFIG, MERGE_RECORDS_THRESHOLD_CONFIG)) {

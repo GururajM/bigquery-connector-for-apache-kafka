@@ -101,6 +101,7 @@ public class BigQuerySinkTask extends SinkTask {
   private final StorageApiBatchModeHandler testStorageApiBatchHandler;
   private final Time time;
   @VisibleForTesting ScheduledExecutorService loadExecutor;
+  @VisibleForTesting ScheduledExecutorService mergeFlushExecutor;
   private AtomicReference<BigQuery> bigQuery;
   private AtomicReference<SchemaManager> schemaManager;
   private SchemaRetriever schemaRetriever;
@@ -109,7 +110,12 @@ public class BigQuerySinkTask extends SinkTask {
   private BigQuerySinkTaskConfig config;
   private SinkRecordConverter recordConverter;
   private RecordTableResolver recordTableResolver;
+  // Upsert/delete through insertAll into intermediate tables, applied with MERGE statements
   private boolean upsertDelete;
+  // Upsert/delete through the Storage Write API into intermediate tables, applied with MERGE
+  private boolean swaMerge;
+  // Whether the connector issues MERGE statements at all (either of the above)
+  private boolean mergeEnabled;
   private MergeBatches mergeBatches;
   private MergeQueries mergeQueries;
   private volatile boolean stopped;
@@ -170,7 +176,7 @@ public class BigQuerySinkTask extends SinkTask {
 
   @Override
   public void flush(Map<TopicPartition, OffsetAndMetadata> offsets) {
-    if (upsertDelete) {
+    if (mergeEnabled) {
       throw new ConnectException(
           "This connector cannot perform upsert/delete on older versions of "
               + "the Connect framework; please upgrade to version 0.10.2.0 or later");
@@ -200,7 +206,7 @@ public class BigQuerySinkTask extends SinkTask {
   @Override
   public Map<TopicPartition, OffsetAndMetadata> preCommit(
       Map<TopicPartition, OffsetAndMetadata> offsets) {
-    if (upsertDelete) {
+    if (mergeEnabled) {
       Map<TopicPartition, OffsetAndMetadata> result = mergeBatches.latestOffsets();
       checkQueueSize();
       return result;
@@ -441,6 +447,8 @@ public class BigQuerySinkTask extends SinkTask {
         !useStorageApi
             && (config.getBoolean(BigQuerySinkConfig.UPSERT_ENABLED_CONFIG)
                 || config.getBoolean(BigQuerySinkConfig.DELETE_ENABLED_CONFIG));
+    swaMerge = config.isStorageWriteApiMergeMode();
+    mergeEnabled = upsertDelete || swaMerge;
 
     retry = config.getInt(BigQuerySinkConfig.BIGQUERY_RETRY_CONFIG);
     retryWait = config.getLong(BigQuerySinkConfig.BIGQUERY_RETRY_WAIT_CONFIG);
@@ -464,7 +472,7 @@ public class BigQuerySinkTask extends SinkTask {
     }
     errantRecordHandler = new ErrantRecordHandler(errantRecordReporter);
 
-    if (upsertDelete) {
+    if (mergeEnabled) {
       String intermediateTableSuffix =
           String.format(
               "_%s_%d_%s_%d",
@@ -492,13 +500,17 @@ public class BigQuerySinkTask extends SinkTask {
 
     if (config.getBoolean(BigQuerySinkTaskConfig.GCS_BQ_TASK_CONFIG)) {
       startGcsToBqLoadTask();
-    } else if (upsertDelete) {
-      mergeQueries =
-          new MergeQueries(
-              config, mergeBatches, executor, getBigQuery(), getSchemaManager(), context);
-      maybeStartMergeFlushTask();
-    } else if (useStorageApi) {
-      initializeStorageApiMode();
+    } else {
+      // Storage Write API merge mode needs both the writer and the merge machinery
+      if (useStorageApi) {
+        initializeStorageApiMode();
+      }
+      if (mergeEnabled) {
+        mergeQueries =
+            new MergeQueries(
+                config, mergeBatches, executor, getBigQuery(), getSchemaManager(), context);
+        maybeStartMergeFlushTask();
+      }
     }
 
     recordConverter = getConverter(config);
@@ -618,18 +630,25 @@ public class BigQuerySinkTask extends SinkTask {
           BigQuerySinkConfig.MERGE_INTERVAL_MS_CONFIG);
       return;
     }
-    logger.info("Attempting to start upsert/delete load executor");
-    loadExecutor = Executors.newScheduledThreadPool(1, new MdcContextThreadFactory());
-    loadExecutor.scheduleAtFixedRate(
+    logger.info("Attempting to start upsert/delete merge flush executor");
+    // Separate from loadExecutor, which the Storage Write API uses in the same task in merge mode
+    mergeFlushExecutor = Executors.newScheduledThreadPool(1, new MdcContextThreadFactory());
+    mergeFlushExecutor.scheduleAtFixedRate(
         mergeQueries::mergeFlushAll, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
   }
 
   @Override
   public void stop() {
     try {
+      maybeStopExecutor(mergeFlushExecutor, "merge flush executor");
       maybeStopExecutor(loadExecutor, "load executor");
       maybeStopExecutor(executor, "table write executor");
-      if (upsertDelete) {
+      // In Storage Write API merge mode, close the streams before dropping the intermediate
+      // tables they write to
+      if (useStorageApi) {
+        storageApiWriter.shutdown();
+      }
+      if (mergeEnabled) {
         mergeBatches
             .intermediateTables()
             .forEach(
@@ -637,8 +656,6 @@ public class BigQuerySinkTask extends SinkTask {
                   logger.debug("Deleting {}", intTable(table));
                   getBigQuery().delete(table);
                 });
-      } else if (useStorageApi) {
-        storageApiWriter.shutdown();
       }
     } finally {
       stopped = true;
@@ -653,7 +670,7 @@ public class BigQuerySinkTask extends SinkTask {
     }
 
     try {
-      if (upsertDelete) {
+      if (mergeEnabled) {
         logger.trace("Forcibly shutting down {}", executorName);
         executor.shutdownNow();
       } else {
