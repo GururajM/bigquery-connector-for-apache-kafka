@@ -30,6 +30,7 @@ import static org.mockito.Mockito.when;
 import com.google.cloud.bigquery.*;
 import com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig;
 import com.wepay.kafka.connect.bigquery.config.BigQuerySinkTaskConfig;
+import com.wepay.kafka.connect.bigquery.utils.PartitionedTableId;
 import com.wepay.kafka.connect.bigquery.write.batch.MergeBatches;
 import java.io.IOException;
 import java.time.LocalDate;
@@ -135,6 +136,27 @@ public class RecordTableResolverTest {
     TableId tableId = recordTableResolver.getRecordTable(mockRecord).getFullTableId();
 
     assertEquals(intermediateTable, tableId.getTable());
+  }
+
+  @Test
+  public void testStorageApiMergeModeResolvesIntermediateTable() {
+    when(mockConfig.getBoolean(BigQuerySinkConfig.USE_STORAGE_WRITE_API_CONFIG)).thenReturn(true);
+    when(mockConfig.getBoolean(BigQuerySinkConfig.UPSERT_ENABLED_CONFIG)).thenReturn(true);
+    when(mockConfig.getBoolean(BigQuerySinkConfig.BIGQUERY_PARTITION_DECORATOR_CONFIG))
+        .thenReturn(true);
+
+    TableId destinationTableId = TableId.of(PROJECT, DATASET, TOPIC);
+    TableId intermediateTableId = TableId.of(PROJECT, DATASET, "intermediate_topic");
+    when(mockMergeBatches.intermediateTableFor(destinationTableId)).thenReturn(intermediateTableId);
+
+    recordTableResolver =
+        new RecordTableResolver(mockConfig, mockMergeBatches, mockBigQuery, true, false, true);
+    PartitionedTableId table = recordTableResolver.getRecordTable(mockRecord);
+
+    // The Storage Write API writes to the intermediate table in the configured project, and the
+    // destination's partition decorator is not applied to it
+    assertEquals(intermediateTableId, table.getFullTableId());
+    assertEquals(intermediateTableId, table.getBaseTableId());
   }
 
   @Test

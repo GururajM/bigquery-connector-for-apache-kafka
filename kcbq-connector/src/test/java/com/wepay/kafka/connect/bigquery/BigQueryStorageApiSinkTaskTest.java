@@ -24,6 +24,7 @@
 package com.wepay.kafka.connect.bigquery;
 
 import static com.wepay.kafka.connect.bigquery.write.storage.StorageWriteApiWriter.DEFAULT;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
@@ -59,6 +60,7 @@ import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTaskContext;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 public class BigQueryStorageApiSinkTaskTest {
   private static final SinkTaskPropertiesFactory propertiesFactory =
@@ -113,6 +115,18 @@ public class BigQueryStorageApiSinkTaskTest {
 
     verify(mockedStorageWriteApiDefaultStream, times(1))
         .initializeAndWriteRecords(any(PartitionedTableId.class), anyList(), eq(DEFAULT));
+  }
+
+  @Test
+  public void testPutWritesToDestinationTable() {
+    testTask.put(Collections.singletonList(spoofSinkRecord()));
+    testTask.flush(Collections.emptyMap());
+
+    // Without merge mode, records go straight to the destination table, not an intermediate one
+    ArgumentCaptor<PartitionedTableId> table = ArgumentCaptor.forClass(PartitionedTableId.class);
+    verify(mockedStorageWriteApiDefaultStream)
+        .initializeAndWriteRecords(table.capture(), anyList(), eq(DEFAULT));
+    assertEquals(topic, table.getValue().getBaseTableId().getTable());
   }
 
   @Test

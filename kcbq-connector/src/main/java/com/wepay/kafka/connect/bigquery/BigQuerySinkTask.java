@@ -494,7 +494,7 @@ public class BigQuerySinkTask extends SinkTask {
             config,
             mergeBatches,
             getBigQuery(),
-            upsertDelete,
+            mergeEnabled,
             useStorageApiBatchMode,
             useStorageApi);
 

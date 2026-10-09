@@ -53,7 +53,7 @@ class RecordTableResolver {
   private final MergeBatches mergeBatches;
   private final Map<String, TableId> topicToTableId = new ConcurrentHashMap<>();
   private final boolean usePartitionDecorator;
-  private final boolean upsertDelete;
+  private final boolean useIntermediateTables;
   private final boolean useMessageTimeDatePartitioning;
   private final boolean forceProjectFromConfig;
 
@@ -61,14 +61,14 @@ class RecordTableResolver {
       BigQuerySinkTaskConfig config,
       MergeBatches mergeBatches,
       BigQuery bigQuery,
-      boolean upsertDelete,
+      boolean useIntermediateTables,
       boolean useStorageApiBatchMode,
       boolean useStorageApi) {
     this.config = config;
     this.mergeBatches = mergeBatches;
     this.bigQuery = bigQuery;
 
-    this.upsertDelete = upsertDelete;
+    this.useIntermediateTables = useIntermediateTables;
     this.useMessageTimeDatePartitioning =
         config.getBoolean(BigQuerySinkConfig.BIGQUERY_MESSAGE_TIME_PARTITIONING_CONFIG);
     this.usePartitionDecorator =
@@ -80,9 +80,10 @@ class RecordTableResolver {
 
   public PartitionedTableId getRecordTable(SinkRecord record) {
     TableId baseTableId = getBaseTableId(record.topic());
-    if (upsertDelete) {
+    if (useIntermediateTables) {
       TableId intermediateTableId = mergeBatches.intermediateTableFor(baseTableId);
-      // If upsert/delete is enabled, we want to stream into a non-partitioned intermediate table
+      // Changes applied with MERGE are written to the intermediate table first, without a
+      // partition decorator; the merge query moves them into the destination table
       return new PartitionedTableId.Builder(intermediateTableId).build();
     }
 

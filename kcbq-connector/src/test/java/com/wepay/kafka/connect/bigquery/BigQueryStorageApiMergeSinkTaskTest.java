@@ -23,23 +23,32 @@
 
 package com.wepay.kafka.connect.bigquery;
 
+import static com.wepay.kafka.connect.bigquery.write.storage.StorageWriteApiWriter.DEFAULT;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 import com.google.cloud.bigquery.BigQuery;
+import com.google.cloud.bigquery.TableId;
 import com.google.cloud.storage.Storage;
 import com.wepay.kafka.connect.bigquery.api.SchemaRetriever;
 import com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig;
 import com.wepay.kafka.connect.bigquery.utils.MockTime;
+import com.wepay.kafka.connect.bigquery.utils.PartitionedTableId;
 import com.wepay.kafka.connect.bigquery.utils.Time;
 import com.wepay.kafka.connect.bigquery.write.storage.StorageApiBatchModeHandler;
 import com.wepay.kafka.connect.bigquery.write.storage.StorageWriteApiDefaultStream;
@@ -47,17 +56,25 @@ import java.util.Collections;
 import java.util.Map;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.record.TimestampType;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTaskContext;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 
 /** Task lifecycle tests for upsert/delete through the Storage Write API in MERGE mode. */
 public class BigQueryStorageApiMergeSinkTaskTest {
   private static final SinkTaskPropertiesFactory propertiesFactory =
       new SinkTaskPropertiesFactory();
   private static final String TOPIC = "test_topic";
+  private static final long WRITE_TIMEOUT_MS = 5_000;
 
   private final StorageWriteApiDefaultStream mockedStorageWriteApiDefaultStream =
       mock(StorageWriteApiDefaultStream.class, CALLS_REAL_METHODS);
@@ -92,6 +109,9 @@ public class BigQueryStorageApiMergeSinkTaskTest {
         BigQuerySinkConfig.STORAGE_WRITE_API_UPSERT_MODE_CONFIG,
         BigQuerySinkConfig.StorageWriteApiUpsertMode.MERGE.name());
 
+    doNothing()
+        .when(mockedStorageWriteApiDefaultStream)
+        .initializeAndWriteRecords(any(PartitionedTableId.class), anyList(), eq(DEFAULT));
     doNothing().when(mockedStorageWriteApiDefaultStream).shutdown();
 
     testTask.initialize(sinkTaskContext);
@@ -152,5 +172,53 @@ public class BigQueryStorageApiMergeSinkTaskTest {
     verify(mockedStorageWriteApiDefaultStream, times(1)).shutdown();
     assertTrue(testTask.mergeFlushExecutor.isShutdown());
     assertTrue(testTask.loadExecutor.isShutdown());
+  }
+
+  @Test
+  public void testPutRoutesToIntermediateTable() {
+    testTask.start(properties);
+
+    testTask.put(Collections.singletonList(spoofSinkRecord()));
+
+    TableId written = captureWrittenTable().getFullTableId();
+    assertEquals("scratch", written.getDataset());
+    // Default intermediate table suffix is "tmp", followed by the task ID
+    assertTrue(
+        written.getTable().startsWith(TOPIC + "_tmp_1_"),
+        "Expected the intermediate table, got " + written.getTable());
+  }
+
+  @Test
+  public void testStopDeletesIntermediateTablesAfterWriterShutdown() {
+    testTask.start(properties);
+    testTask.put(Collections.singletonList(spoofSinkRecord()));
+    TableId intermediateTable = captureWrittenTable().getBaseTableId();
+
+    testTask.stop();
+
+    // Dropping the intermediate table while its streams are still open would fail their appends
+    InOrder inOrder = inOrder(mockedStorageWriteApiDefaultStream, bigQuery);
+    inOrder.verify(mockedStorageWriteApiDefaultStream).shutdown();
+    inOrder.verify(bigQuery).delete(intermediateTable);
+  }
+
+  /** Waits for the asynchronous Storage Write API write and returns the table it targeted. */
+  private PartitionedTableId captureWrittenTable() {
+    ArgumentCaptor<PartitionedTableId> table = ArgumentCaptor.forClass(PartitionedTableId.class);
+    verify(mockedStorageWriteApiDefaultStream, timeout(WRITE_TIMEOUT_MS))
+        .initializeAndWriteRecords(table.capture(), anyList(), eq(DEFAULT));
+    return table.getValue();
+  }
+
+  private SinkRecord spoofSinkRecord() {
+    Schema keySchema = SchemaBuilder.struct().field("id", Schema.INT64_SCHEMA).build();
+    Struct key = new Struct(keySchema).put("id", 1L);
+
+    Schema valueSchema =
+        SchemaBuilder.struct().field("sink_task_test_field", Schema.STRING_SCHEMA).build();
+    Struct value = new Struct(valueSchema).put("sink_task_test_field", "sink task test row");
+
+    return new SinkRecord(
+        TOPIC, 0, keySchema, key, valueSchema, value, 0, null, TimestampType.NO_TIMESTAMP_TYPE);
   }
 }
