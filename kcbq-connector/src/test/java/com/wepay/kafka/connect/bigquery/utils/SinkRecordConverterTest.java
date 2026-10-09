@@ -29,10 +29,14 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.google.cloud.bigquery.TableId;
+import com.wepay.kafka.connect.bigquery.MergeQueries;
 import com.wepay.kafka.connect.bigquery.SchemaManager;
 import com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig;
+import com.wepay.kafka.connect.bigquery.write.batch.MergeBatches;
 import de.huxhorn.sulky.ulid.ULID;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -40,6 +44,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import org.apache.kafka.common.record.TimestampType;
+import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -55,6 +60,7 @@ public class SinkRecordConverterTest {
   private static final int kafkaDataMutatedPartitionValue = 201;
   private static final long kafkaDataMutatedOffsetValue = 456;
   private static final ULID ulid = new ULID();
+  private static final long STAGING_RECORD_TIMESTAMP = 1720000000000L;
 
   private static Map<String, Object> defaultExpectedFields() {
     return new HashMap<>(
@@ -461,5 +467,127 @@ public class SinkRecordConverterTest {
     assertTrue(result.containsKey(SchemaManager.KAFKA_DATA_PARTITION_FIELD_NAME));
     assertTrue(result.containsKey(SchemaManager.KAFKA_DATA_OFFSET_FIELD_NAME));
     assertTrue(result.containsKey(SchemaManager.KAFKA_DATA_INSERT_TIME_FIELD_NAME));
+  }
+
+  @Test
+  public void testGetStagingRowWithStorageWriteApi() {
+    MergeBatches mergeBatches = new MergeBatches("tmp");
+    TableId intermediateTable = mergeBatches.intermediateTableFor(TableId.of("dataset", "table"));
+    SinkRecordConverter underTest =
+        new SinkRecordConverter(createStagingConfig(true, Map.of()), mergeBatches, null);
+
+    long before = System.currentTimeMillis();
+    Map<String, Object> row =
+        underTest.getStagingRow(stagingRecord(Map.of("v", "1")), intermediateTable);
+    long after = System.currentTimeMillis();
+
+    assertEquals(Map.of("id", "k1"), row.get(MergeQueries.INTERMEDIATE_TABLE_KEY_FIELD_NAME));
+    assertEquals(Map.of("v", "1"), row.get(MergeQueries.INTERMEDIATE_TABLE_VALUE_FIELD_NAME));
+    assertEquals(1L, row.get(MergeQueries.INTERMEDIATE_TABLE_ITERATION_FIELD_NAME));
+    assertEquals(0, row.get(MergeQueries.INTERMEDIATE_TABLE_BATCH_NUMBER_FIELD));
+    // Wall-clock partition time, in microseconds for the Storage Write API
+    long partitionTime = (long) row.get(MergeQueries.INTERMEDIATE_TABLE_PARTITION_TIME_FIELD_NAME);
+    assertTrue(partitionTime >= before * 1000 && partitionTime <= after * 1000);
+    // The row is tracked by the current merge batch
+    assertFalse(mergeBatches.isCurrentBatchEmpty(intermediateTable));
+  }
+
+  @Test
+  public void testGetStagingRowUsesMessageTimeInMicroseconds() {
+    MergeBatches mergeBatches = new MergeBatches("tmp");
+    TableId intermediateTable = mergeBatches.intermediateTableFor(TableId.of("dataset", "table"));
+    SinkRecordConverter underTest =
+        new SinkRecordConverter(
+            createStagingConfig(
+                true, Map.of(BigQuerySinkConfig.BIGQUERY_MESSAGE_TIME_PARTITIONING_CONFIG, "true")),
+            mergeBatches,
+            null);
+
+    Map<String, Object> row =
+        underTest.getStagingRow(stagingRecord(Map.of("v", "1")), intermediateTable);
+
+    assertEquals(
+        STAGING_RECORD_TIMESTAMP * 1000,
+        row.get(MergeQueries.INTERMEDIATE_TABLE_PARTITION_TIME_FIELD_NAME));
+  }
+
+  @Test
+  public void testInsertAllUpsertRowKeepsPartitionTimeInSeconds() {
+    MergeBatches mergeBatches = new MergeBatches("tmp");
+    TableId intermediateTable = mergeBatches.intermediateTableFor(TableId.of("dataset", "table"));
+    SinkRecordConverter underTest =
+        new SinkRecordConverter(createStagingConfig(false, Map.of()), mergeBatches, null);
+
+    long before = System.currentTimeMillis();
+    Map<String, Object> row =
+        underTest.getRecordRow(stagingRecord(Map.of("v", "1")), intermediateTable).getContent();
+    long after = System.currentTimeMillis();
+
+    long partitionTime = (long) row.get(MergeQueries.INTERMEDIATE_TABLE_PARTITION_TIME_FIELD_NAME);
+    assertTrue(partitionTime >= before / 1000 && partitionTime <= after / 1000);
+  }
+
+  @Test
+  public void testGetStagingRowAllowsTombstoneWhenDeleteEnabled() {
+    MergeBatches mergeBatches = new MergeBatches("tmp");
+    TableId intermediateTable = mergeBatches.intermediateTableFor(TableId.of("dataset", "table"));
+    SinkRecordConverter underTest =
+        new SinkRecordConverter(
+            createStagingConfig(true, Map.of(BigQuerySinkConfig.DELETE_ENABLED_CONFIG, "true")),
+            mergeBatches,
+            null);
+
+    Map<String, Object> row = underTest.getStagingRow(stagingRecord(null), intermediateTable);
+
+    assertEquals(Map.of("id", "k1"), row.get(MergeQueries.INTERMEDIATE_TABLE_KEY_FIELD_NAME));
+    assertTrue(row.containsKey(MergeQueries.INTERMEDIATE_TABLE_VALUE_FIELD_NAME));
+    assertNull(row.get(MergeQueries.INTERMEDIATE_TABLE_VALUE_FIELD_NAME));
+  }
+
+  @Test
+  public void testGetStagingRowRejectsNullKey() {
+    MergeBatches mergeBatches = new MergeBatches("tmp");
+    TableId intermediateTable = mergeBatches.intermediateTableFor(TableId.of("dataset", "table"));
+    SinkRecordConverter underTest =
+        new SinkRecordConverter(createStagingConfig(true, Map.of()), mergeBatches, null);
+    SinkRecord record =
+        new SinkRecord(
+            kafkaDataTopicValue,
+            kafkaDataPartitionValue,
+            null,
+            null,
+            null,
+            Map.of("v", "1"),
+            kafkaDataOffsetValue);
+
+    assertThrows(ConnectException.class, () -> underTest.getStagingRow(record, intermediateTable));
+  }
+
+  private static TestingBigQuerySinkConfig createStagingConfig(
+      boolean useStorageWriteApi, Map<String, String> overrides) {
+    Map<String, String> properties = new HashMap<>();
+    properties.put(BigQuerySinkConfig.UPSERT_ENABLED_CONFIG, "true");
+    properties.put(
+        BigQuerySinkConfig.USE_STORAGE_WRITE_API_CONFIG, String.valueOf(useStorageWriteApi));
+    if (useStorageWriteApi) {
+      properties.put(
+          BigQuerySinkConfig.STORAGE_WRITE_API_UPSERT_MODE_CONFIG,
+          BigQuerySinkConfig.StorageWriteApiUpsertMode.MERGE.name());
+    }
+    properties.putAll(overrides);
+    return createConfig(properties);
+  }
+
+  private static SinkRecord stagingRecord(Map<String, String> value) {
+    return new SinkRecord(
+        kafkaDataTopicValue,
+        kafkaDataPartitionValue,
+        null,
+        Map.of("id", "k1"),
+        null,
+        value,
+        kafkaDataOffsetValue,
+        STAGING_RECORD_TIMESTAMP,
+        TimestampType.CREATE_TIME);
   }
 }

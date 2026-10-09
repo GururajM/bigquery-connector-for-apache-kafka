@@ -23,7 +23,9 @@
 package com.wepay.kafka.connect.bigquery.write.storage;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -245,6 +247,118 @@ class StorageWriteApiBaseTest {
     assertNotEquals(ulid2, ulid1);
   }
 
+  @Test
+  void cdcModeAddsChangePseudoColumns() {
+    SuccessfulStreamWriter streamWriter =
+        new SuccessfulStreamWriter("cdcModeAddsChangePseudoColumns");
+    StorageWriteApiBase underTest =
+        createStreamWriter(
+            upsertDeleteConfig(BigQuerySinkConfig.StorageWriteApiUpsertMode.CDC), streamWriter);
+
+    assertTrue(underTest.isCdcEnabled());
+    JSONArray rows = writeUpsertAndTombstone(underTest);
+    assertEquals(
+        "UPSERT", rows.getJSONObject(0).get(StorageWriteApiBase.CHANGE_TYPE_PSEUDO_COLUMN));
+    assertEquals(
+        "DELETE", rows.getJSONObject(1).get(StorageWriteApiBase.CHANGE_TYPE_PSEUDO_COLUMN));
+    for (int i = 0; i < rows.length(); i++) {
+      assertTrue(
+          rows.getJSONObject(i).has(StorageWriteApiBase.CHANGE_SEQUENCE_NUMBER_PSEUDO_COLUMN));
+    }
+  }
+
+  @Test
+  void mergeModeOmitsChangePseudoColumns() {
+    SuccessfulStreamWriter streamWriter =
+        new SuccessfulStreamWriter("mergeModeOmitsChangePseudoColumns");
+    StorageWriteApiBase underTest =
+        createStreamWriter(
+            upsertDeleteConfig(BigQuerySinkConfig.StorageWriteApiUpsertMode.MERGE), streamWriter);
+
+    // Rows go to the intermediate table, which has no pseudo-columns; the connector runs the MERGE
+    assertFalse(underTest.isCdcEnabled());
+    JSONArray rows = writeUpsertAndTombstone(underTest);
+    for (int i = 0; i < rows.length(); i++) {
+      assertFalse(rows.getJSONObject(i).has(StorageWriteApiBase.CHANGE_TYPE_PSEUDO_COLUMN));
+      assertFalse(
+          rows.getJSONObject(i).has(StorageWriteApiBase.CHANGE_SEQUENCE_NUMBER_PSEUDO_COLUMN));
+    }
+  }
+
+  @Test
+  void cdcDisabledWithoutUpsertOrDelete() {
+    Map<String, String> params = new HashMap<>(defaultMap);
+    params.put(BigQuerySinkConfig.USE_STORAGE_WRITE_API_CONFIG, "true");
+
+    StorageWriteApiBase underTest =
+        createStreamWriter(
+            new BigQuerySinkTaskConfig(params),
+            new SuccessfulStreamWriter("cdcDisabledWithoutUpsertOrDelete"));
+
+    assertFalse(underTest.isCdcEnabled());
+  }
+
+  private BigQuerySinkTaskConfig upsertDeleteConfig(
+      BigQuerySinkConfig.StorageWriteApiUpsertMode mode) {
+    Map<String, String> params = new HashMap<>(defaultMap);
+    params.put(BigQuerySinkConfig.USE_STORAGE_WRITE_API_CONFIG, "true");
+    params.put(BigQuerySinkConfig.UPSERT_ENABLED_CONFIG, "true");
+    params.put(BigQuerySinkConfig.DELETE_ENABLED_CONFIG, "true");
+    params.put(BigQuerySinkConfig.STORAGE_WRITE_API_UPSERT_MODE_CONFIG, mode.name());
+    return new BigQuerySinkTaskConfig(params);
+  }
+
+  private StorageWriteApiBase createStreamWriter(
+      BigQuerySinkTaskConfig config, StreamWriter streamWriter) {
+    BigQueryWriteClient bigQueryWriteClient = mock(BigQueryWriteClient.class);
+    return new StorageWriteApiBase(
+        0, 0, mock(BigQueryWriteSettings.class), false, null, null, false, config) {
+
+      @Override
+      public void preShutdown() {}
+
+      @Override
+      protected StreamWriter streamWriter(
+          PartitionedTableId table, String streamName, List<ConvertedRecord> records) {
+        return streamWriter;
+      }
+
+      @Override
+      protected BigQueryWriteClient getWriteClient() {
+        return bigQueryWriteClient;
+      }
+    };
+  }
+
+  /** Writes one upsert and one tombstone, and returns the rows sent in the single append. */
+  private JSONArray writeUpsertAndTombstone(StorageWriteApiBase underTest) {
+    Schema valueSchema = SchemaBuilder.struct().field("value", Schema.STRING_SCHEMA).build();
+    SinkRecord upsert =
+        new SinkRecord(
+            "topic",
+            1,
+            Schema.STRING_SCHEMA,
+            "key",
+            valueSchema,
+            new Struct(valueSchema).put("value", "v"),
+            0L);
+    SinkRecord tombstone =
+        new SinkRecord("topic", 1, Schema.STRING_SCHEMA, "key", valueSchema, null, 1L);
+    List<ConvertedRecord> records =
+        List.of(
+            new ConvertedRecord(upsert, new JSONObject().put("value", "v")),
+            new ConvertedRecord(tombstone, new JSONObject()));
+    PartitionedTableId table =
+        new PartitionedTableId.Builder("dataset", "table").setProject("project").build();
+
+    underTest.initializeAndWriteRecords(table, records, "stream", null, null);
+
+    StreamWriter streamWriter = underTest.streamWriter(table, "stream", records);
+    List<JSONArray> appendCalls = ((TestingStreamWriter) streamWriter).appendCalls;
+    assertEquals(1, appendCalls.size());
+    return appendCalls.get(0);
+  }
+
   private String assertSameUlid(JSONArray ary) {
     Set<String> ulids = new HashSet<>();
     for (int i = 0; i < ary.length(); i++) {
@@ -313,6 +427,29 @@ class StorageWriteApiBaseTest {
     }
   }
   ;
+
+  /** A StreamWriter whose appends always succeed. */
+  static class SuccessfulStreamWriter extends TestingStreamWriter {
+
+    SuccessfulStreamWriter(String name) {
+      super(name);
+    }
+
+    @Override
+    ApiFuture<AppendRowsResponse> createFuture() {
+      ApiFuture<AppendRowsResponse> future = mock(ApiFuture.class);
+      try {
+        AppendRowsResponse response = mock(AppendRowsResponse.class);
+        when(future.get()).thenReturn(response);
+        when(response.hasUpdatedSchema()).thenReturn(false);
+        when(response.hasError()).thenReturn(false);
+        when(response.hasAppendResult()).thenReturn(true);
+      } catch (ExecutionException | InterruptedException e) {
+        throw new RuntimeException(e);
+      }
+      return future;
+    }
+  }
 
   static class RowsTooLargeStreamWriter extends TestingStreamWriter {
 

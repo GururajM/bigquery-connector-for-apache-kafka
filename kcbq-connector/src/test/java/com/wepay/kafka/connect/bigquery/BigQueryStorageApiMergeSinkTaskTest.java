@@ -50,9 +50,11 @@ import com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig;
 import com.wepay.kafka.connect.bigquery.utils.MockTime;
 import com.wepay.kafka.connect.bigquery.utils.PartitionedTableId;
 import com.wepay.kafka.connect.bigquery.utils.Time;
+import com.wepay.kafka.connect.bigquery.write.storage.ConvertedRecord;
 import com.wepay.kafka.connect.bigquery.write.storage.StorageApiBatchModeHandler;
 import com.wepay.kafka.connect.bigquery.write.storage.StorageWriteApiDefaultStream;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
@@ -63,6 +65,7 @@ import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTaskContext;
+import org.json.JSONObject;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -186,6 +189,22 @@ public class BigQueryStorageApiMergeSinkTaskTest {
     assertTrue(
         written.getTable().startsWith(TOPIC + "_tmp_1_"),
         "Expected the intermediate table, got " + written.getTable());
+  }
+
+  @Test
+  public void testPutWritesStagingRows() {
+    testTask.start(properties);
+
+    testTask.put(Collections.singletonList(spoofSinkRecord()));
+
+    @SuppressWarnings("unchecked")
+    ArgumentCaptor<List<ConvertedRecord>> records = ArgumentCaptor.forClass(List.class);
+    verify(mockedStorageWriteApiDefaultStream, timeout(WRITE_TIMEOUT_MS))
+        .initializeAndWriteRecords(any(PartitionedTableId.class), records.capture(), eq(DEFAULT));
+    JSONObject row = records.getValue().get(0).converted();
+    assertEquals("{\"id\":1}", row.get(MergeQueries.INTERMEDIATE_TABLE_KEY_FIELD_NAME).toString());
+    assertTrue(row.has(MergeQueries.INTERMEDIATE_TABLE_VALUE_FIELD_NAME));
+    assertEquals(0, row.get(MergeQueries.INTERMEDIATE_TABLE_BATCH_NUMBER_FIELD));
   }
 
   @Test

@@ -111,6 +111,20 @@ public final class SinkRecordConverter {
   }
 
   /**
+   * Converts a record into the intermediate-table row written by the Storage Write API when upserts
+   * and deletes are applied with a connector-issued MERGE. The row has the same shape as the rows
+   * written to the intermediate table by the insertAll path, and is added to the current merge
+   * batch for that table.
+   *
+   * @param record the record to convert.
+   * @param intermediateTable the intermediate table the row is written to.
+   * @return the map of the converted record.
+   */
+  public Map<String, Object> getStagingRow(SinkRecord record, TableId intermediateTable) {
+    return getUpsertDeleteRow(record, intermediateTable, currentPutAttemptId);
+  }
+
+  /**
    * Create the converted row for the case where upsert or delete are enabled.
    *
    * @param record the record to convert.
@@ -154,18 +168,23 @@ public final class SinkRecordConverter {
     result.put(MergeQueries.INTERMEDIATE_TABLE_KEY_FIELD_NAME, convertedKey);
     result.put(MergeQueries.INTERMEDIATE_TABLE_VALUE_FIELD_NAME, convertedValue);
     result.put(MergeQueries.INTERMEDIATE_TABLE_ITERATION_FIELD_NAME, totalBatchSize);
+    // The Storage Write API reads numeric TIMESTAMP values as microseconds since the epoch, while
+    // insertAll reads them as seconds
     if (usePartitionDecorator && useMessageTimeDatePartitioning) {
       if (record.timestampType() == TimestampType.NO_TIMESTAMP_TYPE) {
         throw new ConnectException(
             "Message has no timestamp type, cannot use message timestamp to partition.");
       }
-      result.put(MergeQueries.INTERMEDIATE_TABLE_PARTITION_TIME_FIELD_NAME, record.timestamp());
+      result.put(
+          MergeQueries.INTERMEDIATE_TABLE_PARTITION_TIME_FIELD_NAME,
+          config.useStorageWriteApi() ? record.timestamp() * 1000 : record.timestamp());
     } else {
       // Provide a value for this column even if it's not used for partitioning in the destination
       // table, so that it can be used to deduplicate rows during merge flushes
+      long now = System.currentTimeMillis();
       result.put(
           MergeQueries.INTERMEDIATE_TABLE_PARTITION_TIME_FIELD_NAME,
-          System.currentTimeMillis() / 1000);
+          config.useStorageWriteApi() ? now * 1000 : now / 1000);
     }
 
     return maybeSanitize(result);

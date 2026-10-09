@@ -53,6 +53,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 public class BigQuerySinkConfigTest {
   private SinkPropertiesFactory propertiesFactory;
@@ -475,6 +476,46 @@ public class BigQuerySinkConfigTest {
     Map<String, ConfigValue> errors = errorMap(config.validate());
     assertThat(errors.keySet())
         .containsExactlyInAnyOrder(BigQuerySinkConfig.GCS_BUCKET_NAME_CONFIG, "keyfile");
+  }
+
+  @ParameterizedTest(name = "{0} with MERGE")
+  @CsvSource({
+    BigQuerySinkConfig.TRACK_PUT_ATTEMPTS_CONFIG
+        + ","
+        + UpsertDeleteValidator.MERGE_MODE_TRACK_PUT_ATTEMPTS_ERROR,
+    BigQuerySinkConfig.ENABLE_BATCH_MODE_CONFIG
+        + ","
+        + UpsertDeleteValidator.MERGE_MODE_BATCH_MODE_ERROR
+  })
+  void testStorageWriteApiMergeModeRejectsUnsupportedOption(String option, String error) {
+    Map<String, String> configProperties = propertiesFactory.getProperties();
+    configProperties.put(BigQuerySinkConfig.UPSERT_ENABLED_CONFIG, "true");
+    configProperties.put(BigQuerySinkConfig.USE_STORAGE_WRITE_API_CONFIG, "true");
+    configProperties.put(STORAGE_WRITE_API_UPSERT_MODE_CONFIG, "MERGE");
+    configProperties.put(option, "true");
+
+    BigQuerySinkConfig config = new BigQuerySinkConfig(configProperties);
+    Map<String, ConfigValue> errors = errorMap(config.validate());
+    assertThat(errors.get(BigQuerySinkConfig.UPSERT_ENABLED_CONFIG).errorMessages())
+        .containsExactly(error);
+  }
+
+  @ParameterizedTest(name = "{0} with CDC")
+  @ValueSource(
+      strings = {
+        BigQuerySinkConfig.TRACK_PUT_ATTEMPTS_CONFIG,
+        BigQuerySinkConfig.ENABLE_BATCH_MODE_CONFIG
+      })
+  void testStorageWriteApiCdcModeAcceptsOption(String option) {
+    Map<String, String> configProperties = propertiesFactory.getProperties();
+    configProperties.put(BigQuerySinkConfig.UPSERT_ENABLED_CONFIG, "true");
+    configProperties.put(BigQuerySinkConfig.USE_STORAGE_WRITE_API_CONFIG, "true");
+    configProperties.put(STORAGE_WRITE_API_UPSERT_MODE_CONFIG, "CDC");
+    configProperties.put(option, "true");
+
+    BigQuerySinkConfig config = new BigQuerySinkConfig(configProperties);
+    Map<String, ConfigValue> errors = errorMap(config.validate());
+    assertThat(errors).doesNotContainKey(BigQuerySinkConfig.UPSERT_ENABLED_CONFIG);
   }
 
   @ParameterizedTest(name = "storageWriteApi={0}, upsert={1}, delete={2}, mode={3} -> {4}")

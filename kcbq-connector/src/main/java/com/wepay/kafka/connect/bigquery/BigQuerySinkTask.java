@@ -238,6 +238,9 @@ public class BigQuerySinkTask extends SinkTask {
             StorageWriteApiWriter.Builder storageWriterBuilder =
                 new StorageWriteApiWriter.Builder(
                     storageApiWriter, table, recordConverter, batchHandler);
+            if (swaMerge) {
+              storageWriterBuilder.withStagingRows();
+            }
             if (trackPutAttempts) {
               storageWriterBuilder.withUlidSupplier(() -> ULID_GENERATOR.nextULID());
             }

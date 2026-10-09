@@ -118,6 +118,7 @@ public class StorageWriteApiWriter implements Runnable {
     private final StorageWriteApiBase streamWriter;
     private final StorageApiBatchModeHandler batchModeHandler;
     private Supplier<String> ulidSupplier = null;
+    private boolean stagingRows = false;
 
     /**
      * @deprecated Use {@link #Builder(StorageWriteApiBase, PartitionedTableId, SinkRecordConverter,
@@ -162,23 +163,40 @@ public class StorageWriteApiWriter implements Runnable {
     }
 
     /**
+     * Converts records into intermediate-table rows (see {@link SinkRecordConverter#getStagingRow})
+     * instead of regular rows. Used when upserts and deletes are applied with a connector-issued
+     * MERGE; the table this writer targets is then the intermediate table.
+     *
+     * @return this builder
+     */
+    public Builder withStagingRows() {
+      this.stagingRows = true;
+      return this;
+    }
+
+    /**
      * Captures actual record and corresponding JSONObject converted record
      *
      * @param sinkRecord The actual records
+     * @param tableId The table the record is written to
      */
     @Override
     public void addRow(SinkRecord sinkRecord, TableId tableId) {
-      records.add(new ConvertedRecord(sinkRecord, convertRecord(sinkRecord)));
+      records.add(new ConvertedRecord(sinkRecord, convertRecord(sinkRecord, tableId)));
     }
 
     /**
      * Converts SinkRecord to JSONObject to be sent to BQ Streams
      *
      * @param record which is to be converted
+     * @param tableId the table the record is written to
      * @return converted record as JSONObject
      */
-    private JSONObject convertRecord(SinkRecord record) {
-      Map<String, Object> convertedRecord = recordConverter.getRegularRow(record);
+    private JSONObject convertRecord(SinkRecord record, TableId tableId) {
+      Map<String, Object> convertedRecord =
+          stagingRows
+              ? recordConverter.getStagingRow(record, tableId)
+              : recordConverter.getRegularRow(record);
       return StorageWriteApiBase.getJsonFromMap(convertedRecord);
     }
 

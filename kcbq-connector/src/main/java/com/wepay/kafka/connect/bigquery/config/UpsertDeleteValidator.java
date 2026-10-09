@@ -24,10 +24,12 @@
 package com.wepay.kafka.connect.bigquery.config;
 
 import static com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig.DELETE_ENABLED_CONFIG;
+import static com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig.ENABLE_BATCH_MODE_CONFIG;
 import static com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig.KAFKA_KEY_FIELD_NAME_CONFIG;
 import static com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig.MERGE_INTERVAL_MS_CONFIG;
 import static com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig.MERGE_RECORDS_THRESHOLD_CONFIG;
 import static com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig.STORAGE_WRITE_API_UPSERT_MODE_CONFIG;
+import static com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig.TRACK_PUT_ATTEMPTS_CONFIG;
 import static com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig.UPSERT_ENABLED_CONFIG;
 import static com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig.USE_STORAGE_WRITE_API_CONFIG;
 
@@ -46,8 +48,29 @@ public abstract class UpsertDeleteValidator extends MultiPropertyValidator<BigQu
               MERGE_RECORDS_THRESHOLD_CONFIG,
               KAFKA_KEY_FIELD_NAME_CONFIG,
               USE_STORAGE_WRITE_API_CONFIG,
-              STORAGE_WRITE_API_UPSERT_MODE_CONFIG));
+              STORAGE_WRITE_API_UPSERT_MODE_CONFIG,
+              TRACK_PUT_ATTEMPTS_CONFIG,
+              ENABLE_BATCH_MODE_CONFIG));
   private static final Logger logger = LoggerFactory.getLogger(UpsertDeleteValidator.class);
+
+  public static final String MERGE_MODE_TRACK_PUT_ATTEMPTS_ERROR =
+      TRACK_PUT_ATTEMPTS_CONFIG
+          + " is not supported when "
+          + STORAGE_WRITE_API_UPSERT_MODE_CONFIG
+          + "=MERGE; either disable "
+          + TRACK_PUT_ATTEMPTS_CONFIG
+          + " or set "
+          + STORAGE_WRITE_API_UPSERT_MODE_CONFIG
+          + " to CDC";
+  public static final String MERGE_MODE_BATCH_MODE_ERROR =
+      ENABLE_BATCH_MODE_CONFIG
+          + " is not supported when "
+          + STORAGE_WRITE_API_UPSERT_MODE_CONFIG
+          + "=MERGE; either disable "
+          + ENABLE_BATCH_MODE_CONFIG
+          + " or set "
+          + STORAGE_WRITE_API_UPSERT_MODE_CONFIG
+          + " to CDC";
 
   private UpsertDeleteValidator(String propertyName) {
     super(propertyName);
@@ -79,6 +102,17 @@ public abstract class UpsertDeleteValidator extends MultiPropertyValidator<BigQu
       }
 
     } else {
+      if (config.isStorageWriteApiMergeMode()) {
+        // Retries re-convert rows as regular rows and would add them to the merge batch again
+        if (config.getBoolean(TRACK_PUT_ATTEMPTS_CONFIG)) {
+          return Optional.of(MERGE_MODE_TRACK_PUT_ATTEMPTS_ERROR);
+        }
+        // Pending streams make rows visible only on commit, which merge batches do not track
+        if (config.getBoolean(ENABLE_BATCH_MODE_CONFIG)) {
+          return Optional.of(MERGE_MODE_BATCH_MODE_ERROR);
+        }
+      }
+
       // TODO: remove once records are routed through the intermediate table and merge batches
       // track Storage Write API writes; until then MERGE mode would never commit offsets
       if (config.isStorageWriteApiMergeMode()) {

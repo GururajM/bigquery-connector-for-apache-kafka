@@ -89,6 +89,9 @@ public abstract class StorageWriteApiBase {
   private final boolean attemptSchemaUpdate;
   protected final boolean upsertEnabled;
   protected final boolean deleteEnabled;
+  // Whether upserts and deletes are applied by BigQuery CDC, which needs the change pseudo-columns.
+  // False in merge mode, where rows go to an intermediate table and the connector runs the MERGE.
+  private final boolean cdcEnabled;
   protected SchemaManager schemaManager;
   @VisibleForTesting protected Time time;
   ErrantRecordHandler errantRecordHandler;
@@ -121,6 +124,7 @@ public abstract class StorageWriteApiBase {
     this.attemptSchemaUpdate = attemptSchemaUpdate;
     this.upsertEnabled = config.isUpsertEnabled();
     this.deleteEnabled = config.isDeleteEnabled();
+    this.cdcEnabled = (upsertEnabled || deleteEnabled) && !config.isStorageWriteApiMergeMode();
     this.ignoreUnknownFields = config.isIgnoreUnknownFields();
     try {
       this.writeClient = getWriteClient();
@@ -166,6 +170,7 @@ public abstract class StorageWriteApiBase {
     this.ignoreUnknownFields = false;
     this.upsertEnabled = false;
     this.deleteEnabled = false;
+    this.cdcEnabled = false;
     try {
       this.writeClient = getWriteClient();
     } catch (IOException e) {
@@ -489,7 +494,7 @@ public abstract class StorageWriteApiBase {
   private TableSchema getTableSchemaWithPseudoColumns(String streamName) {
     try {
       TableSchema.Builder schemaBuilder = createTableSchemaBuilder(streamName);
-      if (upsertEnabled || deleteEnabled) {
+      if (cdcEnabled) {
         addUpsertDeletePseudoColumns(schemaBuilder);
       }
       return schemaBuilder.build();
@@ -515,7 +520,7 @@ public abstract class StorageWriteApiBase {
             .build();
     return streamOrTableName -> {
       JsonStreamWriter.Builder builder;
-      if (upsertEnabled || deleteEnabled) {
+      if (cdcEnabled) {
         String streamNameForSchema = streamOrTableName;
         if (!streamNameForSchema.contains(DEFAULT_STREAM_NAME_TRIGGER)) {
           streamNameForSchema += DEFAULT_STREAM_NAME_SUFFIX;
@@ -670,8 +675,9 @@ public abstract class StorageWriteApiBase {
     JSONArray jsonRecords = new JSONArray();
     for (ConvertedRecord item : rows) {
       JSONObject converted = item.converted();
-      if ((item.original().value() != null && upsertEnabled)
-          || (item.original().value() == null && deleteEnabled)) {
+      if (cdcEnabled
+          && ((item.original().value() != null && upsertEnabled)
+              || (item.original().value() == null && deleteEnabled))) {
         Long timestamp = item.original().timestamp();
         long ts = (timestamp != null && timestamp >= 0) ? timestamp : 0L;
         String sequenceNumber =
@@ -685,6 +691,11 @@ public abstract class StorageWriteApiBase {
       jsonRecords.put(converted);
     }
     return jsonRecords;
+  }
+
+  @VisibleForTesting
+  boolean isCdcEnabled() {
+    return cdcEnabled;
   }
 
   protected boolean shouldHandleSchemaMismatch(Exception e) {

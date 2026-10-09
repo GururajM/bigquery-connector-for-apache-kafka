@@ -41,6 +41,7 @@ import com.google.cloud.bigquery.storage.v1.TableName;
 import com.google.cloud.bigquery.storage.v1.TableSchema;
 import com.google.protobuf.ByteString;
 import com.wepay.kafka.connect.bigquery.ErrantRecordHandler;
+import com.wepay.kafka.connect.bigquery.MergeQueries;
 import com.wepay.kafka.connect.bigquery.SchemaManager;
 import com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig;
 import com.wepay.kafka.connect.bigquery.config.BigQuerySinkTaskConfig;
@@ -50,6 +51,7 @@ import com.wepay.kafka.connect.bigquery.utils.MockTime;
 import com.wepay.kafka.connect.bigquery.utils.PartitionedTableId;
 import com.wepay.kafka.connect.bigquery.utils.SinkRecordConverter;
 import com.wepay.kafka.connect.bigquery.utils.TableNameUtils;
+import com.wepay.kafka.connect.bigquery.write.batch.MergeBatches;
 import com.wepay.kafka.connect.bigquery.write.batch.TableWriterBuilder;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -143,6 +145,61 @@ public class StorageWriteApiWriterTest {
 
     Object bytes_check = actual.get("bytes_check");
     assertTrue(bytes_check instanceof ByteString);
+  }
+
+  @Test
+  public void testStagingRowConversion() {
+    StorageWriteApiBase mockStreamWriter = Mockito.mock(StorageWriteApiBase.class);
+    BigQuerySinkTaskConfig config =
+        createConfig(
+            Map.of(
+                BigQuerySinkConfig.USE_STORAGE_WRITE_API_CONFIG,
+                "true",
+                BigQuerySinkConfig.UPSERT_ENABLED_CONFIG,
+                "true",
+                BigQuerySinkConfig.STORAGE_WRITE_API_UPSERT_MODE_CONFIG,
+                BigQuerySinkConfig.StorageWriteApiUpsertMode.MERGE.name(),
+                BigQuerySinkConfig.SANITIZE_FIELD_NAME_CONFIG,
+                "true"));
+
+    MergeBatches mergeBatches = new MergeBatches("tmp");
+    TableId intermediateTable =
+        mergeBatches.intermediateTableFor(TableId.of("test-project", "scratch", "dummy_table"));
+    SinkRecordConverter sinkRecordConverter = new SinkRecordConverter(config, mergeBatches, null);
+    TableWriterBuilder builder =
+        new StorageWriteApiWriter.Builder(
+                mockStreamWriter,
+                new PartitionedTableId.Builder(intermediateTable).build(),
+                sinkRecordConverter,
+                mock(StorageApiBatchModeHandler.class))
+            .withStagingRows();
+    @SuppressWarnings("unchecked")
+    ArgumentCaptor<List<ConvertedRecord>> records = ArgumentCaptor.forClass(List.class);
+
+    builder.addRow(createRecord("abc", 100), intermediateTable);
+    builder.build().run();
+
+    verify(mockStreamWriter, times(1))
+        .initializeAndWriteRecords(any(PartitionedTableId.class), records.capture(), anyString());
+    assertEquals(1, records.getValue().size());
+
+    JSONObject actual = records.getValue().get(0).converted();
+    assertEquals(
+        Set.of(
+            MergeQueries.INTERMEDIATE_TABLE_KEY_FIELD_NAME,
+            MergeQueries.INTERMEDIATE_TABLE_VALUE_FIELD_NAME,
+            MergeQueries.INTERMEDIATE_TABLE_ITERATION_FIELD_NAME,
+            MergeQueries.INTERMEDIATE_TABLE_PARTITION_TIME_FIELD_NAME,
+            MergeQueries.INTERMEDIATE_TABLE_BATCH_NUMBER_FIELD),
+        actual.keySet());
+    // Key and value are nested structs rather than top-level columns
+    assertEquals(
+        "{\"key\":\"12345\"}",
+        actual.get(MergeQueries.INTERMEDIATE_TABLE_KEY_FIELD_NAME).toString());
+    JSONObject value = (JSONObject) actual.get(MergeQueries.INTERMEDIATE_TABLE_VALUE_FIELD_NAME);
+    assertEquals(Set.of("id", "name", "available_name", "bytes_check"), value.keySet());
+    assertEquals(0, actual.get(MergeQueries.INTERMEDIATE_TABLE_BATCH_NUMBER_FIELD));
+    assertFalse(mergeBatches.isCurrentBatchEmpty(intermediateTable));
   }
 
   @Test
