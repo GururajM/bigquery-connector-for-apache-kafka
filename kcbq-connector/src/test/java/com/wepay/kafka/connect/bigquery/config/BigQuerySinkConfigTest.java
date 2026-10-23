@@ -447,22 +447,35 @@ public class BigQuerySinkConfigTest {
     assertThrows(ConfigException.class, () -> new BigQuerySinkConfig(configProperties));
   }
 
+  @ParameterizedTest(name = "upsert={0}, delete={1}")
+  @CsvSource({"true,false", "true,true", "false,true"})
+  void testStorageWriteApiMergeModePassesValidation(String upsert, String delete) {
+    Map<String, String> configProperties = propertiesFactory.getProperties();
+    configProperties.put(BigQuerySinkConfig.UPSERT_ENABLED_CONFIG, upsert);
+    configProperties.put(BigQuerySinkConfig.DELETE_ENABLED_CONFIG, delete);
+    configProperties.put(BigQuerySinkConfig.USE_STORAGE_WRITE_API_CONFIG, "true");
+    configProperties.put(STORAGE_WRITE_API_UPSERT_MODE_CONFIG, "MERGE");
+
+    // Delete-only is supported, unlike in CDC mode, since the connector runs the MERGE
+    BigQuerySinkConfig config = new BigQuerySinkConfig(configProperties);
+    Map<String, ConfigValue> errors = errorMap(config.validate());
+    assertThat(errors.keySet())
+        .containsExactlyInAnyOrder(BigQuerySinkConfig.GCS_BUCKET_NAME_CONFIG, "keyfile");
+  }
+
   @Test
-  void testStorageWriteApiMergeModeIsRejectedByValidation() {
+  void testStorageWriteApiMergeModeRequiresMergeTrigger() {
     Map<String, String> configProperties = propertiesFactory.getProperties();
     configProperties.put(BigQuerySinkConfig.UPSERT_ENABLED_CONFIG, "true");
     configProperties.put(BigQuerySinkConfig.USE_STORAGE_WRITE_API_CONFIG, "true");
     configProperties.put(STORAGE_WRITE_API_UPSERT_MODE_CONFIG, "MERGE");
+    configProperties.put(BigQuerySinkConfig.MERGE_INTERVAL_MS_CONFIG, "-1");
+    configProperties.put(BigQuerySinkConfig.MERGE_RECORDS_THRESHOLD_CONFIG, "-1");
 
     BigQuerySinkConfig config = new BigQuerySinkConfig(configProperties);
     Map<String, ConfigValue> errors = errorMap(config.validate());
-    assertThat(errors.keySet())
-        .containsExactlyInAnyOrder(
-            BigQuerySinkConfig.UPSERT_ENABLED_CONFIG,
-            BigQuerySinkConfig.GCS_BUCKET_NAME_CONFIG,
-            "keyfile");
     assertThat(errors.get(BigQuerySinkConfig.UPSERT_ENABLED_CONFIG).errorMessages())
-        .containsExactly(STORAGE_WRITE_API_UPSERT_MODE_CONFIG + "=MERGE is not yet supported");
+        .containsExactly(UpsertDeleteValidator.MERGE_MODE_NO_MERGE_TRIGGER_ERROR);
   }
 
   @Test

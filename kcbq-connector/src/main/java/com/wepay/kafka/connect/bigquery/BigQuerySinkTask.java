@@ -53,6 +53,7 @@ import com.wepay.kafka.connect.bigquery.write.row.BigQueryWriter;
 import com.wepay.kafka.connect.bigquery.write.row.GcsToBqWriter;
 import com.wepay.kafka.connect.bigquery.write.row.SimpleBigQueryWriter;
 import com.wepay.kafka.connect.bigquery.write.row.UpsertDeleteBigQueryWriter;
+import com.wepay.kafka.connect.bigquery.write.storage.ConvertedRecord;
 import com.wepay.kafka.connect.bigquery.write.storage.IntermediateTableOperations;
 import com.wepay.kafka.connect.bigquery.write.storage.StorageApiBatchModeHandler;
 import com.wepay.kafka.connect.bigquery.write.storage.StorageWriteApiBase;
@@ -66,6 +67,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -75,6 +77,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.errors.ConnectException;
@@ -117,7 +120,7 @@ public class BigQuerySinkTask extends SinkTask {
   private boolean swaMerge;
   // Whether the connector issues MERGE statements at all (either of the above)
   private boolean mergeEnabled;
-  private MergeBatches mergeBatches;
+  @VisibleForTesting MergeBatches mergeBatches;
   private MergeQueries mergeQueries;
   private volatile boolean stopped;
   private TopicPartitionManager topicPartitionManager;
@@ -240,7 +243,10 @@ public class BigQuerySinkTask extends SinkTask {
                 new StorageWriteApiWriter.Builder(
                     storageApiWriter, table, recordConverter, batchHandler);
             if (swaMerge) {
-              storageWriterBuilder.withStagingRows();
+              storageWriterBuilder
+                  .withStagingRows()
+                  .onFinish(
+                      rows -> mergeBatches.onRowWrites(table.getBaseTableId(), rowsByBatch(rows)));
             }
             if (trackPutAttempts) {
               storageWriterBuilder.withUlidSupplier(() -> ULID_GENERATOR.nextULID());
@@ -354,6 +360,14 @@ public class BigQuerySinkTask extends SinkTask {
 
   private BigQuery newBigQuery() {
     return new GcpClientBuilder.BigQueryBuilder().withConfig(config).build();
+  }
+
+  private static Map<Integer, Long> rowsByBatch(List<ConvertedRecord> rows) {
+    return rows.stream()
+        .collect(
+            Collectors.groupingBy(
+                row -> row.converted().getInt(MergeQueries.INTERMEDIATE_TABLE_BATCH_NUMBER_FIELD),
+                Collectors.counting()));
   }
 
   private SchemaManager getSchemaManager() {

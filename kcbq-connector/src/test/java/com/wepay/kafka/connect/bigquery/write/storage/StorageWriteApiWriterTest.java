@@ -25,9 +25,11 @@ package com.wepay.kafka.connect.bigquery.write.storage;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -47,12 +49,14 @@ import com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig;
 import com.wepay.kafka.connect.bigquery.config.BigQuerySinkTaskConfig;
 import com.wepay.kafka.connect.bigquery.convert.BigQueryRecordConverter;
 import com.wepay.kafka.connect.bigquery.convert.RecordConverter;
+import com.wepay.kafka.connect.bigquery.exception.BigQueryStorageWriteApiConnectException;
 import com.wepay.kafka.connect.bigquery.utils.MockTime;
 import com.wepay.kafka.connect.bigquery.utils.PartitionedTableId;
 import com.wepay.kafka.connect.bigquery.utils.SinkRecordConverter;
 import com.wepay.kafka.connect.bigquery.utils.TableNameUtils;
 import com.wepay.kafka.connect.bigquery.write.batch.MergeBatches;
 import com.wepay.kafka.connect.bigquery.write.batch.TableWriterBuilder;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -145,6 +149,48 @@ public class StorageWriteApiWriterTest {
 
     Object bytes_check = actual.get("bytes_check");
     assertTrue(bytes_check instanceof ByteString);
+  }
+
+  @Test
+  public void testOnFinishCalledWithWrittenRows() {
+    StorageWriteApiBase mockStreamWriter = Mockito.mock(StorageWriteApiBase.class);
+    List<List<ConvertedRecord>> finished = new ArrayList<>();
+    TableWriterBuilder builder = onFinishBuilder(mockStreamWriter, finished);
+
+    builder.addRow(createRecord("abc", 100), null);
+    builder.build().run();
+
+    assertEquals(1, finished.size());
+    assertEquals(1, finished.get(0).size());
+  }
+
+  @Test
+  public void testOnFinishNotCalledWhenWriteFails() {
+    StorageWriteApiBase mockStreamWriter = Mockito.mock(StorageWriteApiBase.class);
+    doThrow(new BigQueryStorageWriteApiConnectException("write failed"))
+        .when(mockStreamWriter)
+        .initializeAndWriteRecords(any(PartitionedTableId.class), anyList(), anyString());
+    List<List<ConvertedRecord>> finished = new ArrayList<>();
+    TableWriterBuilder builder = onFinishBuilder(mockStreamWriter, finished);
+
+    builder.addRow(createRecord("abc", 100), null);
+    Runnable writer = builder.build();
+
+    assertThrows(BigQueryStorageWriteApiConnectException.class, writer::run);
+    assertTrue(finished.isEmpty());
+  }
+
+  private TableWriterBuilder onFinishBuilder(
+      StorageWriteApiBase streamWriter, List<List<ConvertedRecord>> finished) {
+    BigQuerySinkTaskConfig config =
+        createConfig(Map.of(BigQuerySinkConfig.USE_STORAGE_WRITE_API_CONFIG, "true"));
+    return new StorageWriteApiWriter.Builder(
+            streamWriter,
+            new PartitionedTableId.Builder(TableId.of("test-project", "scratch", "dummy_table"))
+                .build(),
+            new SinkRecordConverter(config, null, null),
+            mock(StorageApiBatchModeHandler.class))
+        .onFinish(finished::add);
   }
 
   @Test

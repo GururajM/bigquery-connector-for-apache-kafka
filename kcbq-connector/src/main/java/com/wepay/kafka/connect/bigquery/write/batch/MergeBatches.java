@@ -195,7 +195,17 @@ public class MergeBatches {
                             row.getContent()
                                 .get(MergeQueries.INTERMEDIATE_TABLE_BATCH_NUMBER_FIELD),
                     Collectors.counting()));
+    onRowWrites(intermediateTable, rowsByBatch);
+  }
 
+  /**
+   * Record a successful write of rows to the given intermediate table, and decrease the pending
+   * record counts for every applicable batch accordingly.
+   *
+   * @param intermediateTable the intermediate table
+   * @param rowsByBatch the number of rows written for each batch number
+   */
+  public void onRowWrites(TableId intermediateTable, Map<Integer, Long> rowsByBatch) {
     rowsByBatch.forEach(
         (batchNumber, batchSize) -> {
           Batch batch = batch(intermediateTable, batchNumber);

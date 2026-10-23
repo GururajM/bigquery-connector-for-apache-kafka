@@ -62,6 +62,13 @@ public abstract class UpsertDeleteValidator extends MultiPropertyValidator<BigQu
           + " or set "
           + STORAGE_WRITE_API_UPSERT_MODE_CONFIG
           + " to CDC";
+  public static final String MERGE_MODE_NO_MERGE_TRIGGER_ERROR =
+      MERGE_INTERVAL_MS_CONFIG
+          + " and "
+          + MERGE_RECORDS_THRESHOLD_CONFIG
+          + " cannot both be -1 when "
+          + STORAGE_WRITE_API_UPSERT_MODE_CONFIG
+          + "=MERGE";
   public static final String MERGE_MODE_BATCH_MODE_ERROR =
       ENABLE_BATCH_MODE_CONFIG
           + " is not supported when "
@@ -89,10 +96,7 @@ public abstract class UpsertDeleteValidator extends MultiPropertyValidator<BigQu
 
     if (!config.useStorageWriteApi()) {
       // Classic MERGE path: merge interval, threshold and kafkaKeyFieldName are all required
-      long mergeInterval = config.getLong(MERGE_INTERVAL_MS_CONFIG);
-      long mergeRecordsThreshold = config.getLong(MERGE_RECORDS_THRESHOLD_CONFIG);
-
-      if (mergeInterval == -1 && mergeRecordsThreshold == -1) {
+      if (noMergeTrigger(config)) {
         return Optional.of(
             String.format(
                 "%s and %s cannot both be -1 when %s is false",
@@ -101,28 +105,21 @@ public abstract class UpsertDeleteValidator extends MultiPropertyValidator<BigQu
                 USE_STORAGE_WRITE_API_CONFIG));
       }
 
+    } else if (config.isStorageWriteApiMergeMode()) {
+      // Storage Write API MERGE path: the connector runs the MERGE, so it needs a flush trigger
+      if (noMergeTrigger(config)) {
+        return Optional.of(MERGE_MODE_NO_MERGE_TRIGGER_ERROR);
+      }
+      // Retries re-convert rows as regular rows and would add them to the merge batch again
+      if (config.getBoolean(TRACK_PUT_ATTEMPTS_CONFIG)) {
+        return Optional.of(MERGE_MODE_TRACK_PUT_ATTEMPTS_ERROR);
+      }
+      // Pending streams make rows visible only on commit, which merge batches do not track
+      if (config.getBoolean(ENABLE_BATCH_MODE_CONFIG)) {
+        return Optional.of(MERGE_MODE_BATCH_MODE_ERROR);
+      }
+
     } else {
-      if (config.isStorageWriteApiMergeMode()) {
-        // Retries re-convert rows as regular rows and would add them to the merge batch again
-        if (config.getBoolean(TRACK_PUT_ATTEMPTS_CONFIG)) {
-          return Optional.of(MERGE_MODE_TRACK_PUT_ATTEMPTS_ERROR);
-        }
-        // Pending streams make rows visible only on commit, which merge batches do not track
-        if (config.getBoolean(ENABLE_BATCH_MODE_CONFIG)) {
-          return Optional.of(MERGE_MODE_BATCH_MODE_ERROR);
-        }
-      }
-
-      // TODO: remove once records are routed through the intermediate table and merge batches
-      // track Storage Write API writes; until then MERGE mode would never commit offsets
-      if (config.isStorageWriteApiMergeMode()) {
-        return Optional.of(
-            String.format(
-                "%s=%s is not yet supported",
-                STORAGE_WRITE_API_UPSERT_MODE_CONFIG,
-                BigQuerySinkConfig.StorageWriteApiUpsertMode.MERGE.name()));
-      }
-
       // Storage Write API CDC path
       for (String property :
           Arrays.asList(MERGE_INTERVAL_MS_CONFIG, MERGE_RECORDS_THRESHOLD_CONFIG)) {
@@ -146,6 +143,11 @@ public abstract class UpsertDeleteValidator extends MultiPropertyValidator<BigQu
     }
 
     return Optional.empty();
+  }
+
+  private static boolean noMergeTrigger(BigQuerySinkConfig config) {
+    return config.getLong(MERGE_INTERVAL_MS_CONFIG) == -1
+        && config.getLong(MERGE_RECORDS_THRESHOLD_CONFIG) == -1;
   }
 
   /**

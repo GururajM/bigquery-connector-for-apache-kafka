@@ -30,6 +30,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
@@ -51,10 +52,12 @@ import com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig;
 import com.wepay.kafka.connect.bigquery.utils.MockTime;
 import com.wepay.kafka.connect.bigquery.utils.PartitionedTableId;
 import com.wepay.kafka.connect.bigquery.utils.Time;
+import com.wepay.kafka.connect.bigquery.write.batch.MergeBatches;
 import com.wepay.kafka.connect.bigquery.write.storage.ConvertedRecord;
 import com.wepay.kafka.connect.bigquery.write.storage.IntermediateTableOperations;
 import com.wepay.kafka.connect.bigquery.write.storage.StorageApiBatchModeHandler;
 import com.wepay.kafka.connect.bigquery.write.storage.StorageWriteApiDefaultStream;
+import java.time.Duration;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -126,6 +129,7 @@ public class BigQueryStorageApiMergeSinkTaskTest {
 
   @AfterEach
   public void tearDown() {
+    MergeBatches.resetStreamingBufferAvailabilityWait();
     if (testTask.isRunning()) {
       testTask.stop();
     }
@@ -209,6 +213,20 @@ public class BigQueryStorageApiMergeSinkTaskTest {
     assertEquals("{\"id\":1}", row.get(MergeQueries.INTERMEDIATE_TABLE_KEY_FIELD_NAME).toString());
     assertTrue(row.has(MergeQueries.INTERMEDIATE_TABLE_VALUE_FIELD_NAME));
     assertEquals(0, row.get(MergeQueries.INTERMEDIATE_TABLE_BATCH_NUMBER_FIELD));
+  }
+
+  @Test
+  public void testPutMarksStagingRowsWrittenForMergeFlush() {
+    MergeBatches.setStreamingBufferAvailabilityWait(0);
+    testTask.start(properties);
+
+    testTask.put(Collections.singletonList(spoofSinkRecord()));
+    TableId intermediateTable = captureWrittenTable().getBaseTableId();
+
+    // Blocks until every row of the batch has been written, so this fails if the hook is missing
+    assertTimeoutPreemptively(
+        Duration.ofMillis(WRITE_TIMEOUT_MS),
+        () -> assertTrue(testTask.mergeBatches.prepareToFlush(intermediateTable, 0)));
   }
 
   @Test

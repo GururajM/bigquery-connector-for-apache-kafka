@@ -32,6 +32,7 @@ import com.wepay.kafka.connect.bigquery.write.batch.TableWriterBuilder;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.json.JSONObject;
@@ -48,6 +49,7 @@ public class StorageWriteApiWriter implements Runnable {
   private final String streamName;
   private final SinkRecordConverter recordConverter;
   private final Supplier<String> ulidSupplier;
+  private final Consumer<List<ConvertedRecord>> onFinish;
   Logger logger = LoggerFactory.getLogger(StorageWriteApiWriter.class);
 
   /**
@@ -78,7 +80,7 @@ public class StorageWriteApiWriter implements Runnable {
       StorageWriteApiBase streamWriter,
       List<ConvertedRecord> records,
       String streamName) {
-    this(table, streamWriter, records, streamName, null, null);
+    this(table, streamWriter, records, streamName, null, null, rows -> {});
   }
 
   StorageWriteApiWriter(
@@ -87,13 +89,15 @@ public class StorageWriteApiWriter implements Runnable {
       List<ConvertedRecord> records,
       String streamName,
       SinkRecordConverter recordConverter,
-      Supplier<String> ulidSupplier) {
+      Supplier<String> ulidSupplier,
+      Consumer<List<ConvertedRecord>> onFinish) {
     this.streamWriter = streamWriter;
     this.records = records;
     this.table = table;
     this.streamName = streamName;
     this.recordConverter = recordConverter;
     this.ulidSupplier = ulidSupplier;
+    this.onFinish = onFinish;
   }
 
   @Override
@@ -109,6 +113,8 @@ public class StorageWriteApiWriter implements Runnable {
     } else {
       streamWriter.initializeAndWriteRecords(table, records, streamName);
     }
+    // Failed writes throw above; rows sent to the DLQ count as finished
+    onFinish.accept(records);
   }
 
   public static class Builder implements TableWriterBuilder {
@@ -119,6 +125,7 @@ public class StorageWriteApiWriter implements Runnable {
     private final StorageApiBatchModeHandler batchModeHandler;
     private Supplier<String> ulidSupplier = null;
     private boolean stagingRows = false;
+    private Consumer<List<ConvertedRecord>> onFinish = rows -> {};
 
     /**
      * @deprecated Use {@link #Builder(StorageWriteApiBase, PartitionedTableId, SinkRecordConverter,
@@ -175,6 +182,18 @@ public class StorageWriteApiWriter implements Runnable {
     }
 
     /**
+     * Sets a callback to invoke after all rows have been written successfully, which is not invoked
+     * if the write fails. Used in merge mode to notify the merge batches of the write.
+     *
+     * @param onFinish the callback to invoke with the written rows
+     * @return this builder
+     */
+    public Builder onFinish(Consumer<List<ConvertedRecord>> onFinish) {
+      this.onFinish = onFinish;
+      return this;
+    }
+
+    /**
      * Captures actual record and corresponding JSONObject converted record
      *
      * @param sinkRecord The actual records
@@ -211,7 +230,7 @@ public class StorageWriteApiWriter implements Runnable {
         streamName = batchModeHandler.updateOffsetsOnStream(tableName.toString(), records);
       }
       return new StorageWriteApiWriter(
-          table, streamWriter, records, streamName, recordConverter, ulidSupplier);
+          table, streamWriter, records, streamName, recordConverter, ulidSupplier, onFinish);
     }
   }
 }
