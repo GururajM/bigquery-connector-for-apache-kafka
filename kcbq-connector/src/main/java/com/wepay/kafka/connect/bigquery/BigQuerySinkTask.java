@@ -53,6 +53,7 @@ import com.wepay.kafka.connect.bigquery.write.row.BigQueryWriter;
 import com.wepay.kafka.connect.bigquery.write.row.GcsToBqWriter;
 import com.wepay.kafka.connect.bigquery.write.row.SimpleBigQueryWriter;
 import com.wepay.kafka.connect.bigquery.write.row.UpsertDeleteBigQueryWriter;
+import com.wepay.kafka.connect.bigquery.write.storage.IntermediateTableOperations;
 import com.wepay.kafka.connect.bigquery.write.storage.StorageApiBatchModeHandler;
 import com.wepay.kafka.connect.bigquery.write.storage.StorageWriteApiBase;
 import com.wepay.kafka.connect.bigquery.write.storage.StorageWriteApiBatchApplicationStream;
@@ -507,6 +508,11 @@ public class BigQuerySinkTask extends SinkTask {
       // Storage Write API merge mode needs both the writer and the merge machinery
       if (useStorageApi) {
         initializeStorageApiMode();
+        if (swaMerge) {
+          storageApiWriter.useIntermediateTables(
+              new IntermediateTableOperations(
+                  getSchemaManager(), mergeBatches::destinationTableFor, autoCreateTables));
+        }
       }
       if (mergeEnabled) {
         mergeQueries =

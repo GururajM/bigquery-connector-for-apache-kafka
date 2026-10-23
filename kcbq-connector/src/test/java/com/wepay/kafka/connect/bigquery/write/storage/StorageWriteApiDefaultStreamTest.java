@@ -25,10 +25,12 @@ package com.wepay.kafka.connect.bigquery.write.storage;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -235,6 +237,47 @@ public class StorageWriteApiDefaultStreamTest {
     when(defaultStream.getAutoCreateTables()).thenReturn(true);
     defaultStream.initializeAndWriteRecords(mockedPartitionedTableId, testRows, null);
     verify(mockedSchemaManager, times(1)).createTable(any(), any());
+  }
+
+  @Test
+  public void testMissingTableNotCreatedWithoutAutoCreate() throws Exception {
+    when(mockedResponse.get()).thenThrow(tableMissingException).thenReturn(successResponse);
+    when(defaultStream.getAutoCreateTables()).thenReturn(false);
+
+    assertThrows(
+        BigQueryStorageWriteApiConnectException.class,
+        () -> defaultStream.initializeAndWriteRecords(mockedPartitionedTableId, testRows, null));
+    verify(mockedSchemaManager, never()).createTable(any(), any());
+  }
+
+  @Test
+  public void testMergeModeCreatesMissingIntermediateTableWithoutAutoCreate() throws Exception {
+    IntermediateTableOperations intermediateTableOperations =
+        mock(IntermediateTableOperations.class);
+    defaultStream.useIntermediateTables(intermediateTableOperations);
+    when(mockedResponse.get()).thenThrow(tableMissingException).thenReturn(successResponse);
+    when(defaultStream.getAutoCreateTables()).thenReturn(false);
+
+    defaultStream.initializeAndWriteRecords(mockedPartitionedTableId, testRows, null);
+
+    // Intermediate tables are always created, through the intermediate table operations
+    verify(intermediateTableOperations, times(1))
+        .createTable(eq(mockedPartitionedTableId.getBaseTableId()), any());
+    verify(mockedSchemaManager, never()).createTable(any(), any());
+  }
+
+  @Test
+  public void testMergeModeSchemaUpdateUsesIntermediateTableOperations() throws Exception {
+    IntermediateTableOperations intermediateTableOperations =
+        mock(IntermediateTableOperations.class);
+    defaultStream.useIntermediateTables(intermediateTableOperations);
+    when(mockedResponse.get()).thenReturn(schemaError).thenReturn(successResponse);
+
+    defaultStream.initializeAndWriteRecords(mockedPartitionedTableId, testRows, null);
+
+    verify(intermediateTableOperations, times(1))
+        .updateSchema(eq(mockedPartitionedTableId.getBaseTableId()), any());
+    verify(mockedSchemaManager, never()).updateSchema(any(), any());
   }
 
   @Test

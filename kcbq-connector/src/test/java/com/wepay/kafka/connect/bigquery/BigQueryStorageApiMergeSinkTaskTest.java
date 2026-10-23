@@ -41,6 +41,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import com.google.cloud.bigquery.BigQuery;
 import com.google.cloud.bigquery.TableId;
@@ -51,6 +52,7 @@ import com.wepay.kafka.connect.bigquery.utils.MockTime;
 import com.wepay.kafka.connect.bigquery.utils.PartitionedTableId;
 import com.wepay.kafka.connect.bigquery.utils.Time;
 import com.wepay.kafka.connect.bigquery.write.storage.ConvertedRecord;
+import com.wepay.kafka.connect.bigquery.write.storage.IntermediateTableOperations;
 import com.wepay.kafka.connect.bigquery.write.storage.StorageApiBatchModeHandler;
 import com.wepay.kafka.connect.bigquery.write.storage.StorageWriteApiDefaultStream;
 import java.util.Collections;
@@ -86,6 +88,7 @@ public class BigQueryStorageApiMergeSinkTaskTest {
   private final SinkTaskContext sinkTaskContext = mock(SinkTaskContext.class);
   private final SchemaRetriever schemaRetriever = mock(SchemaRetriever.class);
   private final SchemaManager schemaManager = mock(SchemaManager.class);
+  private final SchemaManager intermediateSchemaManager = mock(SchemaManager.class);
   private final Time time = new MockTime();
   private final StorageApiBatchModeHandler storageApiBatchHandler =
       mock(StorageApiBatchModeHandler.class);
@@ -116,6 +119,7 @@ public class BigQueryStorageApiMergeSinkTaskTest {
         .when(mockedStorageWriteApiDefaultStream)
         .initializeAndWriteRecords(any(PartitionedTableId.class), anyList(), eq(DEFAULT));
     doNothing().when(mockedStorageWriteApiDefaultStream).shutdown();
+    when(schemaManager.forIntermediateTables()).thenReturn(intermediateSchemaManager);
 
     testTask.initialize(sinkTaskContext);
   }
@@ -205,6 +209,24 @@ public class BigQueryStorageApiMergeSinkTaskTest {
     assertEquals("{\"id\":1}", row.get(MergeQueries.INTERMEDIATE_TABLE_KEY_FIELD_NAME).toString());
     assertTrue(row.has(MergeQueries.INTERMEDIATE_TABLE_VALUE_FIELD_NAME));
     assertEquals(0, row.get(MergeQueries.INTERMEDIATE_TABLE_BATCH_NUMBER_FIELD));
+  }
+
+  @Test
+  public void testWriterCreatesIntermediateAndDestinationTables() {
+    properties.put(BigQuerySinkConfig.TABLE_CREATE_CONFIG, "true");
+    testTask.start(properties);
+    testTask.put(Collections.singletonList(spoofSinkRecord()));
+    TableId intermediateTable = captureWrittenTable().getBaseTableId();
+
+    ArgumentCaptor<IntermediateTableOperations> operations =
+        ArgumentCaptor.forClass(IntermediateTableOperations.class);
+    verify(mockedStorageWriteApiDefaultStream).useIntermediateTables(operations.capture());
+    List<SinkRecord> records = Collections.singletonList(spoofSinkRecord());
+    operations.getValue().createTable(intermediateTable, records);
+
+    verify(intermediateSchemaManager).createTable(intermediateTable, records);
+    verify(schemaManager)
+        .createOrUpdateTable(TableId.of("test-project", "scratch", TOPIC), records);
   }
 
   @Test

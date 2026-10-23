@@ -153,7 +153,7 @@ public class StorageWriteApiDefaultStream extends StorageWriteApiBase {
               retryHandler.setMostRecentException(
                   new BigQueryStorageWriteApiConnectException(baseErrorMessage, e));
               if (shouldHandleTableCreation(e.getMessage())) {
-                retryHandler.attemptTableOperation(schemaManager::createTable);
+                retryHandler.attemptTableOperation(this::createTable);
               } else if (isNonRetriable(e)) {
                 throw retryHandler.getMostRecentException();
               }

@@ -25,6 +25,7 @@ package com.wepay.kafka.connect.bigquery.write.storage;
 
 import com.google.api.core.ApiFuture;
 import com.google.api.gax.retrying.RetrySettings;
+import com.google.cloud.bigquery.TableId;
 import com.google.cloud.bigquery.storage.v1.AppendRowsResponse;
 import com.google.cloud.bigquery.storage.v1.BigQueryWriteClient;
 import com.google.cloud.bigquery.storage.v1.BigQueryWriteSettings;
@@ -92,6 +93,8 @@ public abstract class StorageWriteApiBase {
   // Whether upserts and deletes are applied by BigQuery CDC, which needs the change pseudo-columns.
   // False in merge mode, where rows go to an intermediate table and the connector runs the MERGE.
   private final boolean cdcEnabled;
+  // Set in merge mode, where records are written to intermediate tables; null otherwise
+  private IntermediateTableOperations intermediateTableOperations;
   protected SchemaManager schemaManager;
   @VisibleForTesting protected Time time;
   ErrantRecordHandler errantRecordHandler;
@@ -333,7 +336,7 @@ public abstract class StorageWriteApiBase {
           throw new BigQueryStorageWriteApiConnectException(
               "Connector is not configured to perform schema updates.");
         }
-        retryHandler.attemptTableOperation(schemaManager::updateSchema);
+        retryHandler.attemptTableOperation(this::updateTableSchema);
         throw new RetryException();
       } else if (writeResult.hasError()) {
         String errorMessage =
@@ -369,14 +372,14 @@ public abstract class StorageWriteApiBase {
       } else if (shouldHandleSchemaMismatch(e)) {
         logger.warn(
             "Sent records schema does not match with table schema, will attempt to update schema");
-        retryHandler.attemptTableOperation(schemaManager::updateSchema);
+        retryHandler.attemptTableOperation(this::updateTableSchema);
       } else if (BigQueryStorageWriteApiErrorResponses.isMessageTooLargeError(message)) {
         throw new BatchTooLargeException(errorMessage);
       } else if (BigQueryStorageWriteApiErrorResponses.isMalformedRequest(message)) {
         throw new MalformedRowsException(getRowErrorMapping(e));
       } else if (BigQueryStorageWriteApiErrorResponses.isTableMissing(message)
-          && getAutoCreateTables()) {
-        retryHandler.attemptTableOperation(schemaManager::createTable);
+          && shouldCreateMissingTables()) {
+        retryHandler.attemptTableOperation(this::createTable);
       } else {
         failTask(retryHandler.getMostRecentException());
       }
@@ -570,6 +573,56 @@ public abstract class StorageWriteApiBase {
     return this.autoCreateTables;
   }
 
+  /**
+   * Writes to intermediate tables from now on, for upserts and deletes applied with a
+   * connector-issued MERGE. Table creation and schema updates then go through the given operations,
+   * and missing intermediate tables are always created. Must be called before any records are
+   * written.
+   *
+   * @param intermediateTableOperations the operations for intermediate and destination tables
+   */
+  public void useIntermediateTables(IntermediateTableOperations intermediateTableOperations) {
+    this.intermediateTableOperations = intermediateTableOperations;
+  }
+
+  /**
+   * @return whether a table that is missing when it is written to should be created
+   */
+  protected boolean shouldCreateMissingTables() {
+    // Intermediate tables are per task and always new, so they must always be created
+    return intermediateTableOperations != null || getAutoCreateTables();
+  }
+
+  /**
+   * Creates the table that records are written to. Every table creation by the Storage Write API
+   * writers goes through this method.
+   *
+   * @param table the table to create
+   * @param records the records used to determine the schema
+   */
+  protected void createTable(TableId table, List<SinkRecord> records) {
+    if (intermediateTableOperations != null) {
+      intermediateTableOperations.createTable(table, records);
+    } else {
+      schemaManager.createTable(table, records);
+    }
+  }
+
+  /**
+   * Updates the schema of the table that records are written to. Every schema update by the Storage
+   * Write API writers goes through this method.
+   *
+   * @param table the table to update
+   * @param records the records used to determine the schema
+   */
+  protected void updateTableSchema(TableId table, List<SinkRecord> records) {
+    if (intermediateTableOperations != null) {
+      intermediateTableOperations.updateSchema(table, records);
+    } else {
+      schemaManager.updateSchema(table, records);
+    }
+  }
+
   protected boolean canAttemptSchemaUpdate() {
     return this.attemptSchemaUpdate;
   }
@@ -718,7 +771,7 @@ public abstract class StorageWriteApiBase {
 
   protected boolean shouldHandleTableCreation(String errorMessage) {
     return BigQueryStorageWriteApiErrorResponses.isTableMissing(errorMessage)
-        && getAutoCreateTables();
+        && shouldCreateMissingTables();
   }
 
   protected boolean isNonRetriable(Exception e) {

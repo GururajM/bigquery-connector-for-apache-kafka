@@ -291,7 +291,7 @@ public class StorageWriteApiBatchApplicationStream extends StorageWriteApiBase {
             // application stream
             return null;
           }
-          retryHandler.attemptTableOperation(schemaManager::createTable);
+          retryHandler.attemptTableOperation(this::createTable);
         } else if (isNonRetriable(e)) {
           failTask(retryHandler.getMostRecentException());
         }
