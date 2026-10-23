@@ -24,8 +24,10 @@
 package com.wepay.kafka.connect.bigquery;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
@@ -53,6 +55,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTaskContext;
 import org.junit.jupiter.api.BeforeEach;
@@ -143,6 +146,7 @@ public class MergeQueriesTest {
   private MergeQueries mergeQueries(boolean insertPartitionTime, boolean upsert, boolean delete) {
     return new MergeQueries(
         KEY,
+        false,
         insertPartitionTime,
         upsert,
         delete,
@@ -154,6 +158,262 @@ public class MergeQueriesTest {
         schemaManager,
         context,
         time);
+  }
+
+  private MergeQueries flattenedMergeQueries(
+      boolean insertPartitionTime, boolean upsert, boolean delete) {
+    return new MergeQueries(
+        "",
+        true,
+        insertPartitionTime,
+        upsert,
+        delete,
+        BIGQUERY_RETRY,
+        BIGQUERY_RETRY_WAIT,
+        mergeBatches,
+        executor,
+        bigQuery,
+        schemaManager,
+        context,
+        time);
+  }
+
+  /** Staging schema whose key field k1 is also in the value, as with Debezium-style records. */
+  private static Schema flattenedIntermediateSchema(
+      List<Field> keyFields, List<Field> valueFields) {
+    return Schema.of(
+        Field.newBuilder(
+                MergeQueries.INTERMEDIATE_TABLE_VALUE_FIELD_NAME,
+                LegacySQLTypeName.RECORD,
+                valueFields.toArray(new Field[0]))
+            .setMode(Field.Mode.NULLABLE)
+            .build(),
+        Field.newBuilder(
+                MergeQueries.INTERMEDIATE_TABLE_KEY_FIELD_NAME,
+                LegacySQLTypeName.RECORD,
+                keyFields.toArray(new Field[0]))
+            .setMode(Field.Mode.REQUIRED)
+            .build(),
+        Field.of(
+            MergeQueries.INTERMEDIATE_TABLE_PARTITION_TIME_FIELD_NAME, LegacySQLTypeName.TIMESTAMP),
+        Field.newBuilder(
+                MergeQueries.INTERMEDIATE_TABLE_BATCH_NUMBER_FIELD, LegacySQLTypeName.INTEGER)
+            .setMode(Field.Mode.REQUIRED)
+            .build());
+  }
+
+  private static final List<Field> FLATTENED_KEY_FIELDS =
+      Arrays.asList(
+          Field.of("k1", LegacySQLTypeName.STRING),
+          Field.of(
+              "k2", LegacySQLTypeName.RECORD, Field.of("nested_k", LegacySQLTypeName.INTEGER)));
+  private static final List<Field> FLATTENED_VALUE_FIELDS =
+      Arrays.asList(
+          Field.of("k1", LegacySQLTypeName.STRING),
+          Field.of("f1", LegacySQLTypeName.STRING),
+          Field.of("f2", LegacySQLTypeName.INTEGER));
+
+  private String flattenedQuery(boolean insertPartitionTime, boolean upsert, boolean delete) {
+    when(schemaManager.cachedSchema(INTERMEDIATE_TABLE))
+        .thenReturn(flattenedIntermediateSchema(FLATTENED_KEY_FIELDS, FLATTENED_VALUE_FIELDS));
+    return flattenedMergeQueries(insertPartitionTime, upsert, delete)
+        .mergeFlushQuery(INTERMEDIATE_TABLE, DESTINATION_TABLE, BATCH_NUMBER);
+  }
+
+  @Test
+  public void testFlattenedUpsertQueryWithPartitionTime() {
+    String expectedQuery =
+        "MERGE "
+            + table(DESTINATION_TABLE)
+            + " dstTableAlias "
+            + "USING (SELECT * FROM (SELECT ARRAY_AGG(x ORDER BY i DESC LIMIT 1)[OFFSET(0)] src "
+            + "FROM "
+            + table(INTERMEDIATE_TABLE)
+            + " x "
+            + "WHERE batchNumber="
+            + BATCH_NUMBER
+            + " "
+            + "GROUP BY key.k1, key.k2.nested_k)) "
+            + "ON dstTableAlias.`k1`=src.key.k1 AND dstTableAlias.`k2`=src.key.k2 "
+            + "WHEN MATCHED "
+            + "THEN UPDATE SET dstTableAlias.`f1`=src.value.f1, dstTableAlias.`f2`=src.value.f2 "
+            + "WHEN NOT MATCHED "
+            + "THEN INSERT (`k1`, `k2`, _PARTITIONTIME, `f1`, `f2`) "
+            + "VALUES (src.key.k1, src.key.k2, "
+            + "CAST(CAST(DATE(src.partitionTime) AS DATE) AS TIMESTAMP), "
+            + "src.value.f1, src.value.f2);";
+    assertEquals(expectedQuery, flattenedQuery(true, true, false));
+  }
+
+  @Test
+  public void testFlattenedUpsertDeleteQuery() {
+    String expectedQuery =
+        "MERGE "
+            + table(DESTINATION_TABLE)
+            + " dstTableAlias "
+            + "USING (SELECT * FROM (SELECT ARRAY_AGG(x ORDER BY i DESC LIMIT 1)[OFFSET(0)] src "
+            + "FROM "
+            + table(INTERMEDIATE_TABLE)
+            + " x "
+            + "WHERE batchNumber="
+            + BATCH_NUMBER
+            + " "
+            + "GROUP BY key.k1, key.k2.nested_k)) "
+            + "ON dstTableAlias.`k1`=src.key.k1 AND dstTableAlias.`k2`=src.key.k2 "
+            + "WHEN MATCHED AND src.value IS NOT NULL "
+            + "THEN UPDATE SET dstTableAlias.`f1`=src.value.f1, dstTableAlias.`f2`=src.value.f2 "
+            + "WHEN MATCHED AND src.value IS NULL "
+            + "THEN DELETE "
+            + "WHEN NOT MATCHED AND src.value IS NOT NULL "
+            + "THEN INSERT (`k1`, `k2`, `f1`, `f2`) "
+            + "VALUES (src.key.k1, src.key.k2, src.value.f1, src.value.f2);";
+    assertEquals(expectedQuery, flattenedQuery(false, true, true));
+  }
+
+  @Test
+  public void testFlattenedDeleteQuery() {
+    String expectedQuery =
+        "MERGE "
+            + table(DESTINATION_TABLE)
+            + " "
+            + "USING (SELECT batch.key AS key, value "
+            + "FROM (SELECT src.i, src.key FROM ("
+            + "SELECT ARRAY_AGG(x ORDER BY i DESC LIMIT 1)[OFFSET(0)] src "
+            + "FROM (SELECT * FROM "
+            + table(INTERMEDIATE_TABLE)
+            + " "
+            + "WHERE batchNumber="
+            + BATCH_NUMBER
+            + ") x "
+            + "WHERE x.value IS NULL "
+            + "GROUP BY key.k1, key.k2.nested_k)) AS deletes "
+            + "RIGHT JOIN ("
+            + "SELECT * FROM "
+            + table(INTERMEDIATE_TABLE)
+            + " "
+            + "WHERE batchNumber="
+            + BATCH_NUMBER
+            + ") AS batch "
+            + "USING (key) "
+            + "WHERE deletes.i IS NULL OR batch.i >= deletes.i "
+            + "ORDER BY batch.i ASC) AS src "
+            + "ON `"
+            + DESTINATION_TABLE.getTable()
+            + "`.`k1`=src.key.k1 AND `"
+            + DESTINATION_TABLE.getTable()
+            + "`.`k2`=src.key.k2 AND src.value IS NULL "
+            + "WHEN MATCHED "
+            + "THEN DELETE "
+            + "WHEN NOT MATCHED AND src.value IS NOT NULL "
+            + "THEN INSERT (`k1`, `k2`, `f1`, `f2`) "
+            + "VALUES (src.key.k1, src.key.k2, src.value.f1, src.value.f2);";
+    assertEquals(expectedQuery, flattenedQuery(false, false, true));
+  }
+
+  @Test
+  public void testFlattenedUpsertQueryWithOnlyKeyColumnsSkipsUpdate() {
+    // Every value field is a key field (matched case-insensitively), so there is nothing to update
+    when(schemaManager.cachedSchema(INTERMEDIATE_TABLE))
+        .thenReturn(
+            flattenedIntermediateSchema(
+                FLATTENED_KEY_FIELDS,
+                Arrays.asList(
+                    Field.of("K1", LegacySQLTypeName.STRING),
+                    Field.of(
+                        "k2",
+                        LegacySQLTypeName.RECORD,
+                        Field.of("nested_k", LegacySQLTypeName.INTEGER)))));
+    String query =
+        flattenedMergeQueries(false, true, false)
+            .mergeFlushQuery(INTERMEDIATE_TABLE, DESTINATION_TABLE, BATCH_NUMBER);
+
+    assertFalse(query.contains("WHEN MATCHED"), query);
+    assertTrue(
+        query.endsWith(
+            "WHEN NOT MATCHED THEN INSERT (`k1`, `k2`) VALUES (src.key.k1, src.key.k2);"),
+        query);
+  }
+
+  @Test
+  public void testFlattenedQueryRejectsKeyValueTypeMismatch() {
+    when(schemaManager.cachedSchema(INTERMEDIATE_TABLE))
+        .thenReturn(
+            flattenedIntermediateSchema(
+                FLATTENED_KEY_FIELDS, Arrays.asList(Field.of("k1", LegacySQLTypeName.INTEGER))));
+    MergeQueries mergeQueries = flattenedMergeQueries(false, true, false);
+
+    ConnectException e =
+        assertThrows(
+            ConnectException.class,
+            () ->
+                mergeQueries.mergeFlushQuery(INTERMEDIATE_TABLE, DESTINATION_TABLE, BATCH_NUMBER));
+    assertEquals(
+        "Key field 'k1' has type STRING but the value field 'k1' has type INTEGER; they map to "
+            + "the same destination column, so their types must match",
+        e.getMessage());
+  }
+
+  @Test
+  public void testFlattenedQueryRejectsNestedKeyValueTypeMismatch() {
+    // Struct equality is positional, so differently ordered subfields do not compare
+    when(schemaManager.cachedSchema(INTERMEDIATE_TABLE))
+        .thenReturn(
+            flattenedIntermediateSchema(
+                Arrays.asList(
+                    Field.of(
+                        "k",
+                        LegacySQLTypeName.RECORD,
+                        Field.of("a", LegacySQLTypeName.STRING),
+                        Field.of("b", LegacySQLTypeName.STRING))),
+                Arrays.asList(
+                    Field.of(
+                        "k",
+                        LegacySQLTypeName.RECORD,
+                        Field.of("b", LegacySQLTypeName.STRING),
+                        Field.of("a", LegacySQLTypeName.STRING)))));
+    MergeQueries mergeQueries = flattenedMergeQueries(false, true, false);
+
+    assertThrows(
+        ConnectException.class,
+        () -> mergeQueries.mergeFlushQuery(INTERMEDIATE_TABLE, DESTINATION_TABLE, BATCH_NUMBER));
+  }
+
+  @Test
+  public void testFlattenedQueryAllowsKeyValueModeDifference() {
+    when(schemaManager.cachedSchema(INTERMEDIATE_TABLE))
+        .thenReturn(
+            flattenedIntermediateSchema(
+                Arrays.asList(
+                    Field.newBuilder("k1", LegacySQLTypeName.STRING)
+                        .setMode(Field.Mode.REQUIRED)
+                        .build()),
+                Arrays.asList(
+                    Field.newBuilder("k1", LegacySQLTypeName.STRING)
+                        .setMode(Field.Mode.NULLABLE)
+                        .build(),
+                    Field.of("f1", LegacySQLTypeName.STRING))));
+
+    String query =
+        flattenedMergeQueries(false, true, false)
+            .mergeFlushQuery(INTERMEDIATE_TABLE, DESTINATION_TABLE, BATCH_NUMBER);
+    assertTrue(query.contains("ON dstTableAlias.`k1`=src.key.k1 WHEN MATCHED"), query);
+  }
+
+  @Test
+  public void testFlattenedQueryRejectsRepeatedKeyValueMismatch() {
+    when(schemaManager.cachedSchema(INTERMEDIATE_TABLE))
+        .thenReturn(
+            flattenedIntermediateSchema(
+                Arrays.asList(Field.of("k1", LegacySQLTypeName.STRING)),
+                Arrays.asList(
+                    Field.newBuilder("k1", LegacySQLTypeName.STRING)
+                        .setMode(Field.Mode.REPEATED)
+                        .build())));
+    MergeQueries mergeQueries = flattenedMergeQueries(false, true, false);
+
+    assertThrows(
+        ConnectException.class,
+        () -> mergeQueries.mergeFlushQuery(INTERMEDIATE_TABLE, DESTINATION_TABLE, BATCH_NUMBER));
   }
 
   private void initialiseMergeBatches() {

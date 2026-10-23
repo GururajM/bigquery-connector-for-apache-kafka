@@ -43,7 +43,13 @@ import com.wepay.kafka.connect.bigquery.utils.SleepUtils;
 import com.wepay.kafka.connect.bigquery.utils.Time;
 import com.wepay.kafka.connect.bigquery.write.batch.KcbqThreadPoolExecutor;
 import com.wepay.kafka.connect.bigquery.write.batch.MergeBatches;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.kafka.connect.errors.ConnectException;
@@ -63,6 +69,8 @@ public class MergeQueries {
   private static final Logger logger = LoggerFactory.getLogger(MergeQueries.class);
 
   private final String keyFieldName;
+  // Whether the destination has one column per key field rather than a single key struct column
+  private final boolean flattenedKey;
   private final boolean insertPartitionTime;
   private final boolean upsertEnabled;
   private final boolean deleteEnabled;
@@ -89,6 +97,7 @@ public class MergeQueries {
                 () ->
                     new ConnectException(
                         "Kafka key field must be configured when upsert/delete is enabled")),
+        config.isStorageWriteApiMergeMode(),
         config.getBoolean(BigQuerySinkConfig.BIGQUERY_PARTITION_DECORATOR_CONFIG),
         config.getBoolean(BigQuerySinkConfig.UPSERT_ENABLED_CONFIG),
         config.getBoolean(BigQuerySinkConfig.DELETE_ENABLED_CONFIG),
@@ -105,6 +114,7 @@ public class MergeQueries {
   @VisibleForTesting
   MergeQueries(
       String keyFieldName,
+      boolean flattenedKey,
       boolean insertPartitionTime,
       boolean upsertEnabled,
       boolean deleteEnabled,
@@ -117,6 +127,7 @@ public class MergeQueries {
       SinkTaskContext context,
       Time time) {
     this.keyFieldName = keyFieldName;
+    this.flattenedKey = flattenedKey;
     this.insertPartitionTime = insertPartitionTime;
     this.upsertEnabled = upsertEnabled;
     this.deleteEnabled = deleteEnabled;
@@ -287,9 +298,20 @@ public class MergeQueries {
     bigQuery.query(QueryJobConfiguration.of(batchClearQuery));
   }
 
+  /*
+     The query templates below show a destination with a single key struct column. With a
+     flattened key (Storage Write API merge mode), the destination has one column per key field
+     instead, so the key parts become:
+       ON `<destinationTable>`.`<keyField>`=src.key.<keyField>[ AND ...]
+       INSERT (`<keyField>`[, `<keyField>`...], ...) VALUES (src.key.<keyField>[, ...], ...)
+     and value fields that are also key fields are left out of UPDATE SET and INSERT.
+  */
   @VisibleForTesting
   String mergeFlushQuery(TableId intermediateTable, TableId destinationTable, int batchNumber) {
     Schema intermediateSchema = schemaManager.cachedSchema(intermediateTable);
+    if (flattenedKey) {
+      checkKeyValueTypes(intermediateSchema);
+    }
 
     if (upsertEnabled && deleteEnabled) {
       return upsertDeleteMergeFlushQuery(
@@ -341,9 +363,9 @@ public class MergeQueries {
             intermediateSchema.getFields().get(INTERMEDIATE_TABLE_KEY_FIELD_NAME).getSubFields(),
             INTERMEDIATE_TABLE_KEY_FIELD_NAME + ".");
 
-    List<String> valueColumns = valueColumns(intermediateSchema);
+    List<String> keyColumns = destinationKeyColumns(intermediateSchema);
+    List<String> valueColumns = nonKeyColumns(valueColumns(intermediateSchema), keyColumns);
 
-    final String key = INTERMEDIATE_TABLE_KEY_FIELD_NAME;
     final String i = INTERMEDIATE_TABLE_ITERATION_FIELD_NAME;
     final String value = INTERMEDIATE_TABLE_VALUE_FIELD_NAME;
     final String batch = INTERMEDIATE_TABLE_BATCH_NUMBER_FIELD;
@@ -373,20 +395,9 @@ public class MergeQueries {
         + ")"
         + ") "
         + "ON "
-        + DESTINATION_TABLE_ALIAS
-        + "."
-        + keyFieldName
-        + "=src."
-        + key
+        + keyCondition(DESTINATION_TABLE_ALIAS, keyColumns)
         + " "
-        + "WHEN MATCHED AND src."
-        + value
-        + " IS NOT NULL "
-        + "THEN UPDATE SET "
-        + valueColumns.stream()
-            .map(col -> DESTINATION_TABLE_ALIAS + ".`" + col + "`=src." + value + "." + col)
-            .collect(Collectors.joining(", "))
-        + " "
+        + whenMatchedUpdate("AND src." + value + " IS NOT NULL ", valueColumns)
         + "WHEN MATCHED AND src."
         + value
         + " IS NULL "
@@ -394,22 +405,8 @@ public class MergeQueries {
         + "WHEN NOT MATCHED AND src."
         + value
         + " IS NOT NULL "
-        + "THEN INSERT (`"
-        + keyFieldName
-        + "`, "
-        + partitionTimePseudoColumn()
-        + "`"
-        + String.join("`, `", valueColumns)
-        + "`) "
-        + "VALUES ("
-        + "src."
-        + key
-        + ", "
-        + partitionTimeValue()
-        + valueColumns.stream()
-            .map(col -> "src." + value + "." + col)
-            .collect(Collectors.joining(", "))
-        + ");";
+        + insertClause(keyColumns, valueColumns)
+        + ";";
   }
 
   /*
@@ -445,11 +442,10 @@ public class MergeQueries {
             intermediateSchema.getFields().get(INTERMEDIATE_TABLE_KEY_FIELD_NAME).getSubFields(),
             INTERMEDIATE_TABLE_KEY_FIELD_NAME + ".");
 
-    List<String> valueColumns = valueColumns(intermediateSchema);
+    List<String> keyColumns = destinationKeyColumns(intermediateSchema);
+    List<String> valueColumns = nonKeyColumns(valueColumns(intermediateSchema), keyColumns);
 
-    final String key = INTERMEDIATE_TABLE_KEY_FIELD_NAME;
     final String i = INTERMEDIATE_TABLE_ITERATION_FIELD_NAME;
-    final String value = INTERMEDIATE_TABLE_VALUE_FIELD_NAME;
     final String batch = INTERMEDIATE_TABLE_BATCH_NUMBER_FIELD;
 
     return "MERGE "
@@ -477,35 +473,12 @@ public class MergeQueries {
         + ")"
         + ") "
         + "ON "
-        + DESTINATION_TABLE_ALIAS
-        + "."
-        + keyFieldName
-        + "=src."
-        + key
+        + keyCondition(DESTINATION_TABLE_ALIAS, keyColumns)
         + " "
-        + "WHEN MATCHED "
-        + "THEN UPDATE SET "
-        + valueColumns.stream()
-            .map(col -> DESTINATION_TABLE_ALIAS + ".`" + col + "`=src." + value + "." + col)
-            .collect(Collectors.joining(", "))
-        + " "
+        + whenMatchedUpdate("", valueColumns)
         + "WHEN NOT MATCHED "
-        + "THEN INSERT (`"
-        + keyFieldName
-        + "`, "
-        + partitionTimePseudoColumn()
-        + "`"
-        + String.join("`, `", valueColumns)
-        + "`) "
-        + "VALUES ("
-        + "src."
-        + key
-        + ", "
-        + partitionTimeValue()
-        + valueColumns.stream()
-            .map(col -> "src." + value + "." + col)
-            .collect(Collectors.joining(", "))
-        + ");";
+        + insertClause(keyColumns, valueColumns)
+        + ";";
   }
 
   /*
@@ -570,7 +543,8 @@ public class MergeQueries {
             intermediateSchema.getFields().get(INTERMEDIATE_TABLE_KEY_FIELD_NAME).getSubFields(),
             INTERMEDIATE_TABLE_KEY_FIELD_NAME + ".");
 
-    List<String> valueColumns = valueColumns(intermediateSchema);
+    List<String> keyColumns = destinationKeyColumns(intermediateSchema);
+    List<String> valueColumns = nonKeyColumns(valueColumns(intermediateSchema), keyColumns);
 
     final String key = INTERMEDIATE_TABLE_KEY_FIELD_NAME;
     final String i = INTERMEDIATE_TABLE_ITERATION_FIELD_NAME;
@@ -637,12 +611,8 @@ public class MergeQueries {
         + "ORDER BY batch."
         + i
         + " ASC) AS src "
-        + "ON `"
-        + destinationTable.getTable()
-        + "`."
-        + keyFieldName
-        + "=src."
-        + key
+        + "ON "
+        + keyCondition("`" + destinationTable.getTable() + "`", keyColumns)
         + " AND src."
         + value
         + " IS NULL "
@@ -651,22 +621,8 @@ public class MergeQueries {
         + "WHEN NOT MATCHED AND src."
         + value
         + " IS NOT NULL "
-        + "THEN INSERT (`"
-        + keyFieldName
-        + "`, "
-        + partitionTimePseudoColumn()
-        + "`"
-        + String.join("`, `", valueColumns)
-        + "`) "
-        + "VALUES ("
-        + "src."
-        + key
-        + ", "
-        + partitionTimeValue()
-        + valueColumns.stream()
-            .map(col -> "src." + value + "." + col)
-            .collect(Collectors.joining(", "))
-        + ");";
+        + insertClause(keyColumns, valueColumns)
+        + ";";
   }
 
   private String table(TableId tableId) {
@@ -683,16 +639,156 @@ public class MergeQueries {
         .collect(Collectors.toList());
   }
 
-  private String partitionTimePseudoColumn() {
-    return insertPartitionTime ? "_PARTITIONTIME, " : "";
+  // The destination's key columns: one per top-level key field when the key is flattened,
+  // otherwise the single key struct column
+  private List<String> destinationKeyColumns(Schema intermediateSchema) {
+    if (!flattenedKey) {
+      return Collections.singletonList(keyFieldName);
+    }
+    return keyFields(intermediateSchema).stream().map(Field::getName).collect(Collectors.toList());
   }
 
-  private String partitionTimeValue() {
-    return insertPartitionTime
-        ? "CAST(CAST(DATE(src."
-            + INTERMEDIATE_TABLE_PARTITION_TIME_FIELD_NAME
-            + ") AS DATE) AS TIMESTAMP), "
-        : "";
+  // A key field that the value also has maps to a single destination column, set from the key
+  private List<String> nonKeyColumns(List<String> valueColumns, List<String> keyColumns) {
+    if (!flattenedKey) {
+      return valueColumns;
+    }
+    Set<String> keyNames =
+        keyColumns.stream().map(MergeQueries::columnName).collect(Collectors.toSet());
+    return valueColumns.stream()
+        .filter(col -> !keyNames.contains(columnName(col)))
+        .collect(Collectors.toList());
+  }
+
+  private String keyCondition(String target, List<String> keyColumns) {
+    if (!flattenedKey) {
+      return target + "." + keyFieldName + "=src." + INTERMEDIATE_TABLE_KEY_FIELD_NAME;
+    }
+    return keyColumns.stream()
+        .map(col -> target + ".`" + col + "`=" + keySource(col))
+        .collect(Collectors.joining(" AND "));
+  }
+
+  private String keySource(String keyColumn) {
+    String key = "src." + INTERMEDIATE_TABLE_KEY_FIELD_NAME;
+    return flattenedKey ? key + "." + keyColumn : key;
+  }
+
+  // Empty when every value column is a key column, since a matched row then has nothing to update
+  private static String whenMatchedUpdate(String condition, List<String> valueColumns) {
+    if (valueColumns.isEmpty()) {
+      return "";
+    }
+    return "WHEN MATCHED "
+        + condition
+        + "THEN UPDATE SET "
+        + valueColumns.stream()
+            .map(
+                col ->
+                    DESTINATION_TABLE_ALIAS
+                        + ".`"
+                        + col
+                        + "`=src."
+                        + INTERMEDIATE_TABLE_VALUE_FIELD_NAME
+                        + "."
+                        + col)
+            .collect(Collectors.joining(", "))
+        + " ";
+  }
+
+  private String insertClause(List<String> keyColumns, List<String> valueColumns) {
+    List<String> columns = new ArrayList<>();
+    List<String> values = new ArrayList<>();
+    for (String keyColumn : keyColumns) {
+      columns.add("`" + keyColumn + "`");
+      values.add(keySource(keyColumn));
+    }
+    if (insertPartitionTime) {
+      columns.add("_PARTITIONTIME");
+      values.add(
+          "CAST(CAST(DATE(src."
+              + INTERMEDIATE_TABLE_PARTITION_TIME_FIELD_NAME
+              + ") AS DATE) AS TIMESTAMP)");
+    }
+    for (String valueColumn : valueColumns) {
+      columns.add("`" + valueColumn + "`");
+      values.add("src." + INTERMEDIATE_TABLE_VALUE_FIELD_NAME + "." + valueColumn);
+    }
+    return "THEN INSERT ("
+        + String.join(", ", columns)
+        + ") VALUES ("
+        + String.join(", ", values)
+        + ")";
+  }
+
+  /**
+   * A key field that the value also has maps to a single destination column, which takes the
+   * value's type. Fails fast if the two types differ, since the MERGE would otherwise compare
+   * mismatched types and BigQuery would reject it with a less clear error.
+   */
+  private static void checkKeyValueTypes(Schema intermediateSchema) {
+    Map<String, Field> valueFields = new HashMap<>();
+    intermediateSchema
+        .getFields()
+        .get(INTERMEDIATE_TABLE_VALUE_FIELD_NAME)
+        .getSubFields()
+        .forEach(field -> valueFields.put(columnName(field.getName()), field));
+    for (Field keyField : keyFields(intermediateSchema)) {
+      Field valueField = valueFields.get(columnName(keyField.getName()));
+      if (valueField != null && !sameType(keyField, valueField)) {
+        throw new ConnectException(
+            String.format(
+                "Key field '%s' has type %s but the value field '%s' has type %s; they map to "
+                    + "the same destination column, so their types must match",
+                keyField.getName(),
+                typeName(keyField),
+                valueField.getName(),
+                typeName(valueField)));
+      }
+    }
+  }
+
+  // REQUIRED and NULLABLE are interchangeable, but REPEATED is part of the type
+  private static boolean sameType(Field left, Field right) {
+    if (!left.getType().equals(right.getType()) || isRepeated(left) != isRepeated(right)) {
+      return false;
+    }
+    FieldList leftSubFields = left.getSubFields();
+    FieldList rightSubFields = right.getSubFields();
+    if (leftSubFields == null || rightSubFields == null) {
+      return leftSubFields == rightSubFields;
+    }
+    if (leftSubFields.size() != rightSubFields.size()) {
+      return false;
+    }
+    // Struct equality is positional, so subfields must match in order
+    for (int i = 0; i < leftSubFields.size(); i++) {
+      Field leftSubField = leftSubFields.get(i);
+      Field rightSubField = rightSubFields.get(i);
+      if (!columnName(leftSubField.getName()).equals(columnName(rightSubField.getName()))
+          || !sameType(leftSubField, rightSubField)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private static boolean isRepeated(Field field) {
+    return field.getMode() == Field.Mode.REPEATED;
+  }
+
+  private static String typeName(Field field) {
+    String type = field.getType().name();
+    return isRepeated(field) ? "ARRAY<" + type + ">" : type;
+  }
+
+  private static FieldList keyFields(Schema intermediateSchema) {
+    return intermediateSchema.getFields().get(INTERMEDIATE_TABLE_KEY_FIELD_NAME).getSubFields();
+  }
+
+  // BigQuery column names are case-insensitive
+  private static String columnName(String name) {
+    return name.toLowerCase(Locale.ROOT);
   }
 
   private String partitionTimeColumn() {
