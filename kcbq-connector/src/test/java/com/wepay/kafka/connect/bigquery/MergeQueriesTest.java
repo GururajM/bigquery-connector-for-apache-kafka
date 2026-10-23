@@ -55,11 +55,14 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.stream.Stream;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTaskContext;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 
 public class MergeQueriesTest {
 
@@ -224,10 +227,70 @@ public class MergeQueriesTest {
             .mergeFlushQuery(INTERMEDIATE_TABLE, DESTINATION_TABLE, BATCH_NUMBER));
   }
 
+  /** Binds the range of the leading key column, k1, for the batch. */
+  private String flattenedKeyRange() {
+    return "DECLARE kcbqKeyRange DEFAULT (SELECT AS STRUCT MIN(key.k1) AS lo, MAX(key.k1) AS hi "
+        + "FROM "
+        + table(INTERMEDIATE_TABLE)
+        + " WHERE batchNumber="
+        + BATCH_NUMBER
+        + "); ";
+  }
+
+  @ParameterizedTest(name = "{0}")
+  @MethodSource("unprunableLeadingKeyFields")
+  public void testFlattenedQueryIsNotPrunedOnUnprunableLeadingKey(Field leadingKeyField) {
+    when(schemaManager.cachedSchema(INTERMEDIATE_TABLE))
+        .thenReturn(
+            flattenedIntermediateSchema(
+                Arrays.asList(leadingKeyField, Field.of("k1", LegacySQLTypeName.STRING)),
+                FLATTENED_VALUE_FIELDS));
+
+    String query =
+        flattenedMergeQueries(false, true, true)
+            .mergeFlushQuery(INTERMEDIATE_TABLE, DESTINATION_TABLE, BATCH_NUMBER);
+
+    // The MERGE scans the whole destination as before instead of failing
+    assertTrue(query.startsWith("MERGE "), query);
+    assertFalse(query.contains("kcbqKeyRange"), query);
+  }
+
+  private static Stream<Field> unprunableLeadingKeyFields() {
+    return Stream.of(
+        Field.of("lead", LegacySQLTypeName.RECORD, Field.of("nested", LegacySQLTypeName.INTEGER)),
+        Field.of("lead", LegacySQLTypeName.FLOAT),
+        Field.of("lead", LegacySQLTypeName.GEOGRAPHY),
+        Field.newBuilder("lead", LegacySQLTypeName.INTEGER).setMode(Field.Mode.REPEATED).build());
+  }
+
+  @Test
+  public void testFlattenedQueryPrunesOnIntegerLeadingKey() {
+    when(schemaManager.cachedSchema(INTERMEDIATE_TABLE))
+        .thenReturn(
+            flattenedIntermediateSchema(
+                Arrays.asList(Field.of("id", LegacySQLTypeName.INTEGER)),
+                Arrays.asList(Field.of("f1", LegacySQLTypeName.STRING))));
+
+    String query =
+        flattenedMergeQueries(false, true, false)
+            .mergeFlushQuery(INTERMEDIATE_TABLE, DESTINATION_TABLE, BATCH_NUMBER);
+
+    assertTrue(
+        query.startsWith(
+            "DECLARE kcbqKeyRange DEFAULT (SELECT AS STRUCT MIN(key.id) AS lo, MAX(key.id) AS hi "),
+        query);
+    assertTrue(
+        query.contains(
+            "ON dstTableAlias.`id`=src.key.id "
+                + "AND dstTableAlias.`id` BETWEEN kcbqKeyRange.lo AND kcbqKeyRange.hi "),
+        query);
+  }
+
   @Test
   public void testFlattenedUpsertQueryWithPartitionTime() {
     String expectedQuery =
-        "MERGE "
+        flattenedKeyRange()
+            + "MERGE "
             + table(DESTINATION_TABLE)
             + " dstTableAlias "
             + "USING (SELECT * FROM (SELECT ARRAY_AGG(x ORDER BY i DESC LIMIT 1)[OFFSET(0)] src "
@@ -239,6 +302,7 @@ public class MergeQueriesTest {
             + " "
             + "GROUP BY key.k1, key.k2.nested_k)) "
             + "ON dstTableAlias.`k1`=src.key.k1 AND dstTableAlias.`k2`=src.key.k2 "
+            + "AND dstTableAlias.`k1` BETWEEN kcbqKeyRange.lo AND kcbqKeyRange.hi "
             + "WHEN MATCHED "
             + "THEN UPDATE SET dstTableAlias.`f1`=src.value.f1, dstTableAlias.`f2`=src.value.f2 "
             + "WHEN NOT MATCHED "
@@ -252,7 +316,8 @@ public class MergeQueriesTest {
   @Test
   public void testFlattenedUpsertDeleteQuery() {
     String expectedQuery =
-        "MERGE "
+        flattenedKeyRange()
+            + "MERGE "
             + table(DESTINATION_TABLE)
             + " dstTableAlias "
             + "USING (SELECT * FROM (SELECT ARRAY_AGG(x ORDER BY i DESC LIMIT 1)[OFFSET(0)] src "
@@ -264,6 +329,7 @@ public class MergeQueriesTest {
             + " "
             + "GROUP BY key.k1, key.k2.nested_k)) "
             + "ON dstTableAlias.`k1`=src.key.k1 AND dstTableAlias.`k2`=src.key.k2 "
+            + "AND dstTableAlias.`k1` BETWEEN kcbqKeyRange.lo AND kcbqKeyRange.hi "
             + "WHEN MATCHED AND src.value IS NOT NULL "
             + "THEN UPDATE SET dstTableAlias.`f1`=src.value.f1, dstTableAlias.`f2`=src.value.f2 "
             + "WHEN MATCHED AND src.value IS NULL "
@@ -277,7 +343,8 @@ public class MergeQueriesTest {
   @Test
   public void testFlattenedDeleteQuery() {
     String expectedQuery =
-        "MERGE "
+        flattenedKeyRange()
+            + "MERGE "
             + table(DESTINATION_TABLE)
             + " "
             + "USING (SELECT batch.key AS key, value "
@@ -305,7 +372,9 @@ public class MergeQueriesTest {
             + DESTINATION_TABLE.getTable()
             + "`.`k1`=src.key.k1 AND `"
             + DESTINATION_TABLE.getTable()
-            + "`.`k2`=src.key.k2 AND src.value IS NULL "
+            + "`.`k2`=src.key.k2 AND `"
+            + DESTINATION_TABLE.getTable()
+            + "`.`k1` BETWEEN kcbqKeyRange.lo AND kcbqKeyRange.hi AND src.value IS NULL "
             + "WHEN MATCHED "
             + "THEN DELETE "
             + "WHEN NOT MATCHED AND src.value IS NOT NULL "
@@ -400,7 +469,11 @@ public class MergeQueriesTest {
     String query =
         flattenedMergeQueries(false, true, false)
             .mergeFlushQuery(INTERMEDIATE_TABLE, DESTINATION_TABLE, BATCH_NUMBER);
-    assertTrue(query.contains("ON dstTableAlias.`k1`=src.key.k1 WHEN MATCHED"), query);
+    assertTrue(
+        query.contains(
+            "ON dstTableAlias.`k1`=src.key.k1 "
+                + "AND dstTableAlias.`k1` BETWEEN kcbqKeyRange.lo AND kcbqKeyRange.hi WHEN MATCHED"),
+        query);
   }
 
   @Test

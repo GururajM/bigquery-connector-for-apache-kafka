@@ -32,14 +32,18 @@ import static com.wepay.kafka.connect.bigquery.MergeQueries.INTERMEDIATE_TABLE_V
 
 import com.google.cloud.bigquery.Field;
 import com.google.cloud.bigquery.FieldList;
+import com.google.cloud.bigquery.LegacySQLTypeName;
 import com.google.cloud.bigquery.Schema;
 import com.google.cloud.bigquery.TableId;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -47,9 +51,25 @@ import org.apache.kafka.connect.errors.ConnectException;
 
 /**
  * Builds the MERGE that applies one batch of an intermediate table to its destination, for upserts,
- * deletes or both. This is the connector's standard query, with no partition pruning.
+ * deletes or both. With a flattened key, the MERGE is preceded by a script statement that binds the
+ * batch's key range, so the destination can be pruned on its leading key column.
  */
 public class DefaultMergeQueryBuilder implements MergeQueryBuilder {
+
+  private static final String KEY_RANGE = "kcbqKeyRange";
+  // Types BigQuery can partition or cluster on that also have a well-defined range
+  private static final Set<LegacySQLTypeName> PRUNABLE_TYPES =
+      Collections.unmodifiableSet(
+          new HashSet<>(
+              Arrays.asList(
+                  LegacySQLTypeName.INTEGER,
+                  LegacySQLTypeName.NUMERIC,
+                  LegacySQLTypeName.BIGNUMERIC,
+                  LegacySQLTypeName.STRING,
+                  LegacySQLTypeName.BOOLEAN,
+                  LegacySQLTypeName.DATE,
+                  LegacySQLTypeName.DATETIME,
+                  LegacySQLTypeName.TIMESTAMP)));
 
   private final String keyFieldName;
   // Whether the destination has one column per key field rather than a single key struct column
@@ -96,15 +116,19 @@ public class DefaultMergeQueryBuilder implements MergeQueryBuilder {
       checkKeyValueTypes(intermediateSchema);
     }
 
+    String keyRange = keyRangeDeclaration(intermediateTable, batchNumber, intermediateSchema);
     if (upsertEnabled && deleteEnabled) {
-      return upsertDeleteMergeFlushQuery(
-          intermediateTable, destinationTable, batchNumber, intermediateSchema);
+      return keyRange
+          + upsertDeleteMergeFlushQuery(
+              intermediateTable, destinationTable, batchNumber, intermediateSchema);
     } else if (upsertEnabled) {
-      return upsertMergeFlushQuery(
-          intermediateTable, destinationTable, batchNumber, intermediateSchema);
+      return keyRange
+          + upsertMergeFlushQuery(
+              intermediateTable, destinationTable, batchNumber, intermediateSchema);
     } else if (deleteEnabled) {
-      return deleteMergeFlushQuery(
-          intermediateTable, destinationTable, batchNumber, intermediateSchema);
+      return keyRange
+          + deleteMergeFlushQuery(
+              intermediateTable, destinationTable, batchNumber, intermediateSchema);
     } else {
       throw new IllegalStateException(
           "At least one of upsert or delete must be enabled for merge flushing to occur.");
@@ -178,7 +202,7 @@ public class DefaultMergeQueryBuilder implements MergeQueryBuilder {
         + ")"
         + ") "
         + "ON "
-        + keyCondition(DESTINATION_TABLE_ALIAS, keyColumns)
+        + keyCondition(DESTINATION_TABLE_ALIAS, keyColumns, intermediateSchema)
         + " "
         + whenMatchedUpdate("AND src." + value + " IS NOT NULL ", valueColumns)
         + "WHEN MATCHED AND src."
@@ -256,7 +280,7 @@ public class DefaultMergeQueryBuilder implements MergeQueryBuilder {
         + ")"
         + ") "
         + "ON "
-        + keyCondition(DESTINATION_TABLE_ALIAS, keyColumns)
+        + keyCondition(DESTINATION_TABLE_ALIAS, keyColumns, intermediateSchema)
         + " "
         + whenMatchedUpdate("", valueColumns)
         + "WHEN NOT MATCHED "
@@ -395,7 +419,7 @@ public class DefaultMergeQueryBuilder implements MergeQueryBuilder {
         + i
         + " ASC) AS src "
         + "ON "
-        + keyCondition("`" + destinationTable.getTable() + "`", keyColumns)
+        + keyCondition("`" + destinationTable.getTable() + "`", keyColumns, intermediateSchema)
         + " AND src."
         + value
         + " IS NULL "
@@ -443,13 +467,84 @@ public class DefaultMergeQueryBuilder implements MergeQueryBuilder {
         .collect(Collectors.toList());
   }
 
-  private String keyCondition(String target, List<String> keyColumns) {
+  private String keyCondition(String target, List<String> keyColumns, Schema intermediateSchema) {
     if (!flattenedKey) {
       return target + "." + keyFieldName + "=src." + INTERMEDIATE_TABLE_KEY_FIELD_NAME;
     }
-    return keyColumns.stream()
-        .map(col -> target + ".`" + col + "`=" + keySource(col))
-        .collect(Collectors.joining(" AND "));
+    String condition =
+        keyColumns.stream()
+            .map(col -> target + ".`" + col + "`=" + keySource(col))
+            .collect(Collectors.joining(" AND "));
+    return pruningKeyField(intermediateSchema)
+        .map(
+            field ->
+                condition
+                    + " AND "
+                    + target
+                    + ".`"
+                    + field.getName()
+                    + "` BETWEEN "
+                    + KEY_RANGE
+                    + ".lo AND "
+                    + KEY_RANGE
+                    + ".hi")
+        .orElse(condition);
+  }
+
+  /*
+     DECLARE kcbqKeyRange DEFAULT (
+       SELECT AS STRUCT MIN(key.<leadingKeyField>) AS lo, MAX(key.<leadingKeyField>) AS hi
+       FROM `<dataset>`.`<intermediateTable>`
+       WHERE batchNumber=<batchNumber>
+     );
+
+     Binds the batch's range of the leading key column before the MERGE, which then adds
+       AND `<destinationTable>`.`<leadingKeyField>` BETWEEN kcbqKeyRange.lo AND kcbqKeyRange.hi
+     to its ON clause. The range is a constant by the time the MERGE is planned, so BigQuery can
+     skip destination partitions or clustered blocks outside it. The predicate never changes which
+     rows match: a row's key never changes, and no row outside the batch's range could match a
+     batch row. Rows with a NULL key never match on equality either, so a NULL range (a batch whose
+     keys are all NULL) changes nothing.
+  */
+  private String keyRangeDeclaration(
+      TableId intermediateTable, int batchNumber, Schema intermediateSchema) {
+    return pruningKeyField(intermediateSchema)
+        .map(
+            field -> {
+              String key = INTERMEDIATE_TABLE_KEY_FIELD_NAME + "." + field.getName();
+              return "DECLARE "
+                  + KEY_RANGE
+                  + " DEFAULT (SELECT AS STRUCT MIN("
+                  + key
+                  + ") AS lo, MAX("
+                  + key
+                  + ") AS hi FROM "
+                  + table(intermediateTable)
+                  + " WHERE "
+                  + INTERMEDIATE_TABLE_BATCH_NUMBER_FIELD
+                  + "="
+                  + batchNumber
+                  + "); ";
+            })
+        .orElse("");
+  }
+
+  /**
+   * The key field to prune the destination on: the leading key column of a flattened key, since
+   * partitioning and clustering can only use leading columns. Empty when the key is not flattened
+   * or the leading column cannot be partitioned or clustered on with a well-defined range (for
+   * example a {@code RECORD}, or a {@code FLOAT}, where a NaN would make the range match nothing),
+   * in which case the MERGE scans the whole destination as before.
+   */
+  private Optional<Field> pruningKeyField(Schema intermediateSchema) {
+    if (!flattenedKey) {
+      return Optional.empty();
+    }
+    Field leadingKeyField = keyFields(intermediateSchema).get(0);
+    if (isRepeated(leadingKeyField) || !PRUNABLE_TYPES.contains(leadingKeyField.getType())) {
+      return Optional.empty();
+    }
+    return Optional.of(leadingKeyField);
   }
 
   private String keySource(String keyColumn) {
