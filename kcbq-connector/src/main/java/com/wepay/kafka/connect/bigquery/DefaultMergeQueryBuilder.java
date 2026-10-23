@@ -1,0 +1,594 @@
+/*
+ * Copyright 2024 Copyright 2022 Aiven Oy and
+ * bigquery-connector-for-apache-kafka project contributors
+ *
+ * This software contains code derived from the Confluent BigQuery
+ * Kafka Connector, Copyright Confluent, Inc, which in turn
+ * contains code derived from the WePay BigQuery Kafka Connector,
+ * Copyright WePay, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package com.wepay.kafka.connect.bigquery;
+
+import static com.wepay.kafka.connect.bigquery.MergeQueries.DESTINATION_TABLE_ALIAS;
+import static com.wepay.kafka.connect.bigquery.MergeQueries.INTERMEDIATE_TABLE_BATCH_NUMBER_FIELD;
+import static com.wepay.kafka.connect.bigquery.MergeQueries.INTERMEDIATE_TABLE_ITERATION_FIELD_NAME;
+import static com.wepay.kafka.connect.bigquery.MergeQueries.INTERMEDIATE_TABLE_KEY_FIELD_NAME;
+import static com.wepay.kafka.connect.bigquery.MergeQueries.INTERMEDIATE_TABLE_PARTITION_TIME_FIELD_NAME;
+import static com.wepay.kafka.connect.bigquery.MergeQueries.INTERMEDIATE_TABLE_VALUE_FIELD_NAME;
+
+import com.google.cloud.bigquery.Field;
+import com.google.cloud.bigquery.FieldList;
+import com.google.cloud.bigquery.Schema;
+import com.google.cloud.bigquery.TableId;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import org.apache.kafka.connect.errors.ConnectException;
+
+/**
+ * Builds the MERGE that applies one batch of an intermediate table to its destination, for upserts,
+ * deletes or both. This is the connector's standard query, with no partition pruning.
+ */
+public class DefaultMergeQueryBuilder implements MergeQueryBuilder {
+
+  private final String keyFieldName;
+  // Whether the destination has one column per key field rather than a single key struct column
+  private final boolean flattenedKey;
+  private final boolean insertPartitionTime;
+  private final boolean upsertEnabled;
+  private final boolean deleteEnabled;
+
+  /**
+   * @param keyFieldName the destination's key struct column; unused when the key is flattened
+   * @param flattenedKey whether the destination has one column per key field
+   * @param insertPartitionTime whether to set {@code _PARTITIONTIME} on inserted rows
+   * @param upsertEnabled whether upserts are enabled
+   * @param deleteEnabled whether deletes are enabled
+   */
+  public DefaultMergeQueryBuilder(
+      String keyFieldName,
+      boolean flattenedKey,
+      boolean insertPartitionTime,
+      boolean upsertEnabled,
+      boolean deleteEnabled) {
+    this.keyFieldName = keyFieldName;
+    this.flattenedKey = flattenedKey;
+    this.insertPartitionTime = insertPartitionTime;
+    this.upsertEnabled = upsertEnabled;
+    this.deleteEnabled = deleteEnabled;
+  }
+
+  /*
+     The query templates below show a destination with a single key struct column. With a
+     flattened key (Storage Write API merge mode), the destination has one column per key field
+     instead, so the key parts become:
+       ON `<destinationTable>`.`<keyField>`=src.key.<keyField>[ AND ...]
+       INSERT (`<keyField>`[, `<keyField>`...], ...) VALUES (src.key.<keyField>[, ...], ...)
+     and value fields that are also key fields are left out of UPDATE SET and INSERT.
+  */
+  @Override
+  public String build(
+      TableId intermediateTable,
+      TableId destinationTable,
+      int batchNumber,
+      Schema intermediateSchema) {
+    if (flattenedKey) {
+      checkKeyValueTypes(intermediateSchema);
+    }
+
+    if (upsertEnabled && deleteEnabled) {
+      return upsertDeleteMergeFlushQuery(
+          intermediateTable, destinationTable, batchNumber, intermediateSchema);
+    } else if (upsertEnabled) {
+      return upsertMergeFlushQuery(
+          intermediateTable, destinationTable, batchNumber, intermediateSchema);
+    } else if (deleteEnabled) {
+      return deleteMergeFlushQuery(
+          intermediateTable, destinationTable, batchNumber, intermediateSchema);
+    } else {
+      throw new IllegalStateException(
+          "At least one of upsert or delete must be enabled for merge flushing to occur.");
+    }
+  }
+
+  /*
+     MERGE `<dataset>`.`<destinationTable>`
+     USING (
+       SELECT * FROM (
+         SELECT ARRAY_AGG(
+           x ORDER BY i DESC LIMIT 1
+         )[OFFSET(0)] src
+         FROM `<dataset>`.`<intermediateTable>` x
+         WHERE batchNumber=<batchNumber>
+         GROUP BY key.<field>[, key.<field>...]
+       )
+     )
+     ON `<destinationTable>`.<keyField>=src.key
+     WHEN MATCHED AND src.value IS NOT NULL
+       THEN UPDATE SET `<valueField>`=src.value.<field>[, `<valueField>`=src.value.<field>...]
+     WHEN MATCHED AND src.value IS NULL
+       THEN DELETE
+     WHEN NOT MATCHED AND src.value IS NOT NULL
+       THEN INSERT (`<keyField>`, [_PARTITIONTIME, ]`<valueField>`[, `<valueField>`])
+       VALUES (
+         src.key,
+         [CAST(CAST(DATE(src.partitionTime) AS DATE) AS TIMESTAMP),]
+         src.value.<field>[, src.value.<field>...]
+       );
+  */
+  private String upsertDeleteMergeFlushQuery(
+      TableId intermediateTable,
+      TableId destinationTable,
+      int batchNumber,
+      Schema intermediateSchema) {
+    List<String> keyFields =
+        listFields(
+            intermediateSchema.getFields().get(INTERMEDIATE_TABLE_KEY_FIELD_NAME).getSubFields(),
+            INTERMEDIATE_TABLE_KEY_FIELD_NAME + ".");
+
+    List<String> keyColumns = destinationKeyColumns(intermediateSchema);
+    List<String> valueColumns = nonKeyColumns(valueColumns(intermediateSchema), keyColumns);
+
+    final String i = INTERMEDIATE_TABLE_ITERATION_FIELD_NAME;
+    final String value = INTERMEDIATE_TABLE_VALUE_FIELD_NAME;
+    final String batch = INTERMEDIATE_TABLE_BATCH_NUMBER_FIELD;
+
+    return "MERGE "
+        + table(destinationTable)
+        + " "
+        + DESTINATION_TABLE_ALIAS
+        + " "
+        + "USING ("
+        + "SELECT * FROM ("
+        + "SELECT ARRAY_AGG("
+        + "x ORDER BY "
+        + i
+        + " DESC LIMIT 1"
+        + ")[OFFSET(0)] src "
+        + "FROM "
+        + table(intermediateTable)
+        + " x "
+        + "WHERE "
+        + batch
+        + "="
+        + batchNumber
+        + " "
+        + "GROUP BY "
+        + String.join(", ", keyFields)
+        + ")"
+        + ") "
+        + "ON "
+        + keyCondition(DESTINATION_TABLE_ALIAS, keyColumns)
+        + " "
+        + whenMatchedUpdate("AND src." + value + " IS NOT NULL ", valueColumns)
+        + "WHEN MATCHED AND src."
+        + value
+        + " IS NULL "
+        + "THEN DELETE "
+        + "WHEN NOT MATCHED AND src."
+        + value
+        + " IS NOT NULL "
+        + insertClause(keyColumns, valueColumns)
+        + ";";
+  }
+
+  /*
+     MERGE `<dataset>`.`<destinationTable>`
+     USING (
+       SELECT * FROM (
+         SELECT ARRAY_AGG(
+           x ORDER BY i DESC LIMIT 1
+         )[OFFSET(0)] src
+         FROM `<dataset>`.`<intermediateTable>` x
+         WHERE batchNumber=<batchNumber>
+         GROUP BY key.<field>[, key.<field>...]
+       )
+     )
+     ON `<destinationTable>`.<keyField>=src.key
+     WHEN MATCHED
+       THEN UPDATE SET `<valueField>`=src.value.<field>[, `<valueField>`=src.value.<field>...]
+     WHEN NOT MATCHED
+       THEN INSERT (`<keyField>`, [_PARTITIONTIME, ]`<valueField>`[, `<valueField>`])
+       VALUES (
+         src.key,
+         [CAST(CAST(DATE(src.partitionTime) AS DATE) AS TIMESTAMP),]
+         src.value.<field>[, src.value.<field>...]
+       );
+  */
+  private String upsertMergeFlushQuery(
+      TableId intermediateTable,
+      TableId destinationTable,
+      int batchNumber,
+      Schema intermediateSchema) {
+    List<String> keyFields =
+        listFields(
+            intermediateSchema.getFields().get(INTERMEDIATE_TABLE_KEY_FIELD_NAME).getSubFields(),
+            INTERMEDIATE_TABLE_KEY_FIELD_NAME + ".");
+
+    List<String> keyColumns = destinationKeyColumns(intermediateSchema);
+    List<String> valueColumns = nonKeyColumns(valueColumns(intermediateSchema), keyColumns);
+
+    final String i = INTERMEDIATE_TABLE_ITERATION_FIELD_NAME;
+    final String batch = INTERMEDIATE_TABLE_BATCH_NUMBER_FIELD;
+
+    return "MERGE "
+        + table(destinationTable)
+        + " "
+        + DESTINATION_TABLE_ALIAS
+        + " "
+        + "USING ("
+        + "SELECT * FROM ("
+        + "SELECT ARRAY_AGG("
+        + "x ORDER BY "
+        + i
+        + " DESC LIMIT 1"
+        + ")[OFFSET(0)] src "
+        + "FROM "
+        + table(intermediateTable)
+        + " x "
+        + "WHERE "
+        + batch
+        + "="
+        + batchNumber
+        + " "
+        + "GROUP BY "
+        + String.join(", ", keyFields)
+        + ")"
+        + ") "
+        + "ON "
+        + keyCondition(DESTINATION_TABLE_ALIAS, keyColumns)
+        + " "
+        + whenMatchedUpdate("", valueColumns)
+        + "WHEN NOT MATCHED "
+        + insertClause(keyColumns, valueColumns)
+        + ";";
+  }
+
+  /*
+       Delete-only is the trickiest mode. Naively, we could just run a MERGE using the intermediate
+     table as a source and sort in ascending order of iteration. However, this would miss an edge
+     case where, for a given key, a non-tombstone record is sent and then followed by a tombstone,
+     and would result in all rows with that key being deleted from the table, followed by an
+     insertion of a row for the initial non-tombstone record. This is incorrect; any and all
+     records with a given key that precede a tombstone should either never make it into BigQuery or
+     be deleted once the tombstone record is merge flushed.
+       So instead, we have to try to filter out rows from the source (i.e., intermediate) table
+     that precede tombstone records for their keys. We do this by:
+       - Finding the latest tombstone row for each key in the current batch and extracting the
+         iteration number for each, referring to this as the "deletes" table
+       - Joining that with the current batch from the intermediate table on the row key, keeping
+         both tables' iteration numbers (a RIGHT JOIN is used so that rows whose keys don't have
+         any tombstones present are included with a NULL iteration number for the "deletes" table)
+       - Filtering out all rows where the "delete" table's iteration number is non-null, and their
+         iteration number is less than the "delete" table's iteration number
+       This gives us only rows from the most recent tombstone onward, and works in both cases where
+     the most recent row for a key is or is not a tombstone.
+
+     MERGE `<dataset>`.`<destinationTable>`
+     USING (
+       SELECT batch.key AS key, [partitionTime, ]value
+        FROM (
+         SELECT src.i, src.key FROM (
+           SELECT ARRAY_AGG(
+             x ORDER BY i DESC LIMIT 1
+           )[OFFSET(0)] src
+           FROM (
+             SELECT * FROM `<dataset>`.`<intermediateTable>`
+             WHERE batchNumber=<batchNumber>
+           ) x
+           WHERE x.value IS NULL
+           GROUP BY key.<field>[, key.<field>...])) AS deletes
+         RIGHT JOIN (
+           SELECT * FROM `<dataset>`.`<intermediateTable`
+           WHERE batchNumber=<batchNumber>
+         ) AS batch
+         USING (key)
+       WHERE deletes.i IS NULL OR batch.i >= deletes.i
+       ORDER BY batch.i ASC) AS src
+     ON `<destinationTable>`.<keyField>=src.key AND src.value IS NULL
+     WHEN MATCHED
+       THEN DELETE
+     WHEN NOT MATCHED AND src.value IS NOT NULL
+     THEN INSERT (`<keyField>`, [_PARTITIONTIME, ]`<valueField>`[, `<valueField>`])
+     VALUES (
+       src.key,
+       [CAST(CAST(DATE(src.partitionTime) AS DATE) AS TIMESTAMP),]
+       src.value.<field>[, src.value.<field>...]
+     );
+  */
+  private String deleteMergeFlushQuery(
+      TableId intermediateTable,
+      TableId destinationTable,
+      int batchNumber,
+      Schema intermediateSchema) {
+    List<String> keyFields =
+        listFields(
+            intermediateSchema.getFields().get(INTERMEDIATE_TABLE_KEY_FIELD_NAME).getSubFields(),
+            INTERMEDIATE_TABLE_KEY_FIELD_NAME + ".");
+
+    List<String> keyColumns = destinationKeyColumns(intermediateSchema);
+    List<String> valueColumns = nonKeyColumns(valueColumns(intermediateSchema), keyColumns);
+
+    final String key = INTERMEDIATE_TABLE_KEY_FIELD_NAME;
+    final String i = INTERMEDIATE_TABLE_ITERATION_FIELD_NAME;
+    final String value = INTERMEDIATE_TABLE_VALUE_FIELD_NAME;
+    final String batch = INTERMEDIATE_TABLE_BATCH_NUMBER_FIELD;
+
+    return "MERGE "
+        + table(destinationTable)
+        + " "
+        + "USING ("
+        + "SELECT batch."
+        + key
+        + " AS "
+        + key
+        + ", "
+        + partitionTimeColumn()
+        + value
+        + " "
+        + "FROM ("
+        + "SELECT src."
+        + i
+        + ", src."
+        + key
+        + " FROM ("
+        + "SELECT ARRAY_AGG("
+        + "x ORDER BY "
+        + i
+        + " DESC LIMIT 1"
+        + ")[OFFSET(0)] src "
+        + "FROM ("
+        + "SELECT * FROM "
+        + table(intermediateTable)
+        + " "
+        + "WHERE "
+        + batch
+        + "="
+        + batchNumber
+        + ") x "
+        + "WHERE x."
+        + value
+        + " IS NULL "
+        + "GROUP BY "
+        + String.join(", ", keyFields)
+        + ")) AS deletes "
+        + "RIGHT JOIN ("
+        + "SELECT * FROM "
+        + table(intermediateTable)
+        + " "
+        + "WHERE "
+        + batch
+        + "="
+        + batchNumber
+        + ") AS batch "
+        + "USING ("
+        + key
+        + ") "
+        + "WHERE deletes."
+        + i
+        + " IS NULL OR batch."
+        + i
+        + " >= deletes."
+        + i
+        + " "
+        + "ORDER BY batch."
+        + i
+        + " ASC) AS src "
+        + "ON "
+        + keyCondition("`" + destinationTable.getTable() + "`", keyColumns)
+        + " AND src."
+        + value
+        + " IS NULL "
+        + "WHEN MATCHED "
+        + "THEN DELETE "
+        + "WHEN NOT MATCHED AND src."
+        + value
+        + " IS NOT NULL "
+        + insertClause(keyColumns, valueColumns)
+        + ";";
+  }
+
+  private String table(TableId tableId) {
+    return String.format("`%s`.`%s`", tableId.getDataset(), tableId.getTable());
+  }
+
+  private List<String> valueColumns(Schema intermediateTableSchema) {
+    return intermediateTableSchema
+        .getFields()
+        .get(INTERMEDIATE_TABLE_VALUE_FIELD_NAME)
+        .getSubFields()
+        .stream()
+        .map(Field::getName)
+        .collect(Collectors.toList());
+  }
+
+  // The destination's key columns: one per top-level key field when the key is flattened,
+  // otherwise the single key struct column
+  private List<String> destinationKeyColumns(Schema intermediateSchema) {
+    if (!flattenedKey) {
+      return Collections.singletonList(keyFieldName);
+    }
+    return keyFields(intermediateSchema).stream().map(Field::getName).collect(Collectors.toList());
+  }
+
+  // A key field that the value also has maps to a single destination column, set from the key
+  private List<String> nonKeyColumns(List<String> valueColumns, List<String> keyColumns) {
+    if (!flattenedKey) {
+      return valueColumns;
+    }
+    Set<String> keyNames =
+        keyColumns.stream().map(DefaultMergeQueryBuilder::columnName).collect(Collectors.toSet());
+    return valueColumns.stream()
+        .filter(col -> !keyNames.contains(columnName(col)))
+        .collect(Collectors.toList());
+  }
+
+  private String keyCondition(String target, List<String> keyColumns) {
+    if (!flattenedKey) {
+      return target + "." + keyFieldName + "=src." + INTERMEDIATE_TABLE_KEY_FIELD_NAME;
+    }
+    return keyColumns.stream()
+        .map(col -> target + ".`" + col + "`=" + keySource(col))
+        .collect(Collectors.joining(" AND "));
+  }
+
+  private String keySource(String keyColumn) {
+    String key = "src." + INTERMEDIATE_TABLE_KEY_FIELD_NAME;
+    return flattenedKey ? key + "." + keyColumn : key;
+  }
+
+  // Empty when every value column is a key column, since a matched row then has nothing to update
+  private static String whenMatchedUpdate(String condition, List<String> valueColumns) {
+    if (valueColumns.isEmpty()) {
+      return "";
+    }
+    return "WHEN MATCHED "
+        + condition
+        + "THEN UPDATE SET "
+        + valueColumns.stream()
+            .map(
+                col ->
+                    DESTINATION_TABLE_ALIAS
+                        + ".`"
+                        + col
+                        + "`=src."
+                        + INTERMEDIATE_TABLE_VALUE_FIELD_NAME
+                        + "."
+                        + col)
+            .collect(Collectors.joining(", "))
+        + " ";
+  }
+
+  private String insertClause(List<String> keyColumns, List<String> valueColumns) {
+    List<String> columns = new ArrayList<>();
+    List<String> values = new ArrayList<>();
+    for (String keyColumn : keyColumns) {
+      columns.add("`" + keyColumn + "`");
+      values.add(keySource(keyColumn));
+    }
+    if (insertPartitionTime) {
+      columns.add("_PARTITIONTIME");
+      values.add(
+          "CAST(CAST(DATE(src."
+              + INTERMEDIATE_TABLE_PARTITION_TIME_FIELD_NAME
+              + ") AS DATE) AS TIMESTAMP)");
+    }
+    for (String valueColumn : valueColumns) {
+      columns.add("`" + valueColumn + "`");
+      values.add("src." + INTERMEDIATE_TABLE_VALUE_FIELD_NAME + "." + valueColumn);
+    }
+    return "THEN INSERT ("
+        + String.join(", ", columns)
+        + ") VALUES ("
+        + String.join(", ", values)
+        + ")";
+  }
+
+  /**
+   * A key field that the value also has maps to a single destination column, which takes the
+   * value's type. Fails fast if the two types differ, since the MERGE would otherwise compare
+   * mismatched types and BigQuery would reject it with a less clear error.
+   */
+  private static void checkKeyValueTypes(Schema intermediateSchema) {
+    Map<String, Field> valueFields = new HashMap<>();
+    intermediateSchema
+        .getFields()
+        .get(INTERMEDIATE_TABLE_VALUE_FIELD_NAME)
+        .getSubFields()
+        .forEach(field -> valueFields.put(columnName(field.getName()), field));
+    for (Field keyField : keyFields(intermediateSchema)) {
+      Field valueField = valueFields.get(columnName(keyField.getName()));
+      if (valueField != null && !sameType(keyField, valueField)) {
+        throw new ConnectException(
+            String.format(
+                "Key field '%s' has type %s but the value field '%s' has type %s; they map to "
+                    + "the same destination column, so their types must match",
+                keyField.getName(),
+                typeName(keyField),
+                valueField.getName(),
+                typeName(valueField)));
+      }
+    }
+  }
+
+  // REQUIRED and NULLABLE are interchangeable, but REPEATED is part of the type
+  private static boolean sameType(Field left, Field right) {
+    if (!left.getType().equals(right.getType()) || isRepeated(left) != isRepeated(right)) {
+      return false;
+    }
+    FieldList leftSubFields = left.getSubFields();
+    FieldList rightSubFields = right.getSubFields();
+    if (leftSubFields == null || rightSubFields == null) {
+      return leftSubFields == rightSubFields;
+    }
+    if (leftSubFields.size() != rightSubFields.size()) {
+      return false;
+    }
+    // Struct equality is positional, so subfields must match in order
+    for (int i = 0; i < leftSubFields.size(); i++) {
+      Field leftSubField = leftSubFields.get(i);
+      Field rightSubField = rightSubFields.get(i);
+      if (!columnName(leftSubField.getName()).equals(columnName(rightSubField.getName()))
+          || !sameType(leftSubField, rightSubField)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private static boolean isRepeated(Field field) {
+    return field.getMode() == Field.Mode.REPEATED;
+  }
+
+  private static String typeName(Field field) {
+    String type = field.getType().name();
+    return isRepeated(field) ? "ARRAY<" + type + ">" : type;
+  }
+
+  private static FieldList keyFields(Schema intermediateSchema) {
+    return intermediateSchema.getFields().get(INTERMEDIATE_TABLE_KEY_FIELD_NAME).getSubFields();
+  }
+
+  // BigQuery column names are case-insensitive
+  private static String columnName(String name) {
+    return name.toLowerCase(Locale.ROOT);
+  }
+
+  private String partitionTimeColumn() {
+    return insertPartitionTime ? INTERMEDIATE_TABLE_PARTITION_TIME_FIELD_NAME + ", " : "";
+  }
+
+  private static List<String> listFields(FieldList keyFields, String prefix) {
+    return keyFields.stream()
+        .flatMap(
+            field -> {
+              String fieldName = prefix + field.getName();
+              FieldList subFields = field.getSubFields();
+              if (subFields == null) {
+                return Stream.of(fieldName);
+              }
+              return listFields(subFields, fieldName + ".").stream();
+            })
+        .collect(Collectors.toList());
+  }
+}

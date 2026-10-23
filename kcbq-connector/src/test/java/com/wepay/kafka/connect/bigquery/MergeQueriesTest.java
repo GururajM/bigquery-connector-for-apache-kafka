@@ -144,12 +144,13 @@ public class MergeQueriesTest {
   }
 
   private MergeQueries mergeQueries(boolean insertPartitionTime, boolean upsert, boolean delete) {
+    return mergeQueries(
+        new DefaultMergeQueryBuilder(KEY, false, insertPartitionTime, upsert, delete));
+  }
+
+  private MergeQueries mergeQueries(MergeQueryBuilder mergeQueryBuilder) {
     return new MergeQueries(
-        KEY,
-        false,
-        insertPartitionTime,
-        upsert,
-        delete,
+        mergeQueryBuilder,
         BIGQUERY_RETRY,
         BIGQUERY_RETRY_WAIT,
         mergeBatches,
@@ -162,20 +163,8 @@ public class MergeQueriesTest {
 
   private MergeQueries flattenedMergeQueries(
       boolean insertPartitionTime, boolean upsert, boolean delete) {
-    return new MergeQueries(
-        "",
-        true,
-        insertPartitionTime,
-        upsert,
-        delete,
-        BIGQUERY_RETRY,
-        BIGQUERY_RETRY_WAIT,
-        mergeBatches,
-        executor,
-        bigQuery,
-        schemaManager,
-        context,
-        time);
+    return mergeQueries(
+        new DefaultMergeQueryBuilder("", true, insertPartitionTime, upsert, delete));
   }
 
   /** Staging schema whose key field k1 is also in the value, as with Debezium-style records. */
@@ -218,6 +207,21 @@ public class MergeQueriesTest {
         .thenReturn(flattenedIntermediateSchema(FLATTENED_KEY_FIELDS, FLATTENED_VALUE_FIELDS));
     return flattenedMergeQueries(insertPartitionTime, upsert, delete)
         .mergeFlushQuery(INTERMEDIATE_TABLE, DESTINATION_TABLE, BATCH_NUMBER);
+  }
+
+  @Test
+  public void testCustomMergeQueryBuilderIsUsed() {
+    // A pruning builder may return a script that bounds the batch before the MERGE
+    String script = "DECLARE keyMin INT64; SET keyMin = 1; MERGE ...;";
+    MergeQueryBuilder mergeQueryBuilder = mock(MergeQueryBuilder.class);
+    when(mergeQueryBuilder.build(
+            INTERMEDIATE_TABLE, DESTINATION_TABLE, BATCH_NUMBER, INTERMEDIATE_TABLE_SCHEMA))
+        .thenReturn(script);
+
+    assertEquals(
+        script,
+        mergeQueries(mergeQueryBuilder)
+            .mergeFlushQuery(INTERMEDIATE_TABLE, DESTINATION_TABLE, BATCH_NUMBER));
   }
 
   @Test
